@@ -17,10 +17,10 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use mysql_async::prelude::*;
 use mysql_async::Opts;
 use mysql_common as myc;
@@ -101,22 +101,28 @@ where
                     table: String::new(),
                     column: "@@max_allowed_packet".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
                     table: String::new(),
                     column: "@@wait_timeout".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
                     table: String::new(),
                     column: "@@socket".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 },
             ];
             let mut row_writer = results.start(&cols).await?;
@@ -294,22 +300,28 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for InitCountingShim {
                     table: String::new(),
                     column: "@@max_allowed_packet".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
                     table: String::new(),
                     column: "@@wait_timeout".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
                     table: String::new(),
                     column: "@@socket".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 },
             ];
             let mut row_writer = results.start(&columns).await?;
@@ -367,6 +379,136 @@ async fn handshake_with_initial_database_relies_on_backend_ack() {
     );
 }
 
+struct LocalInfileShim {
+    data: Arc<Mutex<Vec<u8>>>,
+}
+
+#[async_trait]
+impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for LocalInfileShim {
+    type Error = io::Error;
+
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _query: &'a str,
+        _info: StatementMetaWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "prepare not supported in test shim",
+        ))
+    }
+
+    async fn on_execute<'a>(
+        &'a mut self,
+        _id: u32,
+        _params: ParamParser<'a>,
+        _results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "execute not supported in test shim",
+        ))
+    }
+
+    async fn on_close<'a>(&'a mut self, _stmt: u32) {}
+
+    async fn on_query<'a>(
+        &'a mut self,
+        query: &'a str,
+        results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        if query.eq_ignore_ascii_case("SELECT @@socket")
+            || query.eq_ignore_ascii_case("SELECT @@wait_timeout")
+            || query.eq_ignore_ascii_case("SELECT @@max_allowed_packet")
+            || query.eq_ignore_ascii_case("SELECT @@max_allowed_packet,@@wait_timeout,@@socket")
+        {
+            results.completed(OkResponse::default()).await
+        } else {
+            results
+                .error(ErrorKind::ER_PARSE_ERROR, b"unexpected query")
+                .await
+        }
+    }
+
+    fn local_infile_request(&self, query: &str) -> Option<String> {
+        if query
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("load data local infile")
+        {
+            Some("dummy".to_string())
+        } else {
+            None
+        }
+    }
+
+    async fn on_local_infile_start<'a>(&'a mut self, _query: &'a str) -> Result<(), Self::Error> {
+        self.data.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn on_local_infile_data<'a>(&'a mut self, data: &'a [u8]) -> Result<(), Self::Error> {
+        self.data.lock().unwrap().extend_from_slice(data);
+        Ok(())
+    }
+
+    async fn on_local_infile_end<'a>(
+        &'a mut self,
+        _query: &'a str,
+        results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        results
+            .completed(OkResponse {
+                affected_rows: 2,
+                ..OkResponse::default()
+            })
+            .await
+    }
+
+    async fn on_init<'a>(
+        &'a mut self,
+        _schema: &'a str,
+        writer: InitWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        writer.ok().await
+    }
+}
+
+#[tokio::test]
+async fn load_data_local_infile_streams_client_data_and_returns_ok() {
+    let data = Arc::new(Mutex::new(Vec::new()));
+    let shim = LocalInfileShim { data: data.clone() };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let (r, w) = socket.into_split();
+        let w = BufWriter::with_capacity(100 * 1024, w);
+        AsyncMysqlIntermediary::run_on(shim, r, w).await.unwrap();
+    });
+
+    let opts = Opts::from_url(&format!("mysql://127.0.0.1:{port}")).unwrap();
+    let mut conn = mysql_async::Conn::new(opts).await.unwrap();
+    conn.set_infile_handler(async move {
+        Ok(futures::stream::iter([
+            bytes::Bytes::from_static(b"1,a\n"),
+            bytes::Bytes::from_static(b"2,b\n"),
+        ])
+        .map(Ok)
+        .boxed())
+    });
+    conn.query_drop("LOAD DATA LOCAL INFILE 'dummy' INTO TABLE t")
+        .await
+        .unwrap();
+    conn.disconnect().await.unwrap();
+    server.await.unwrap();
+
+    assert_eq!(&*data.lock().unwrap(), b"1,a\n2,b\n");
+}
+
 #[tokio::test]
 async fn empty_response() {
     TestingShim::new(
@@ -391,8 +533,10 @@ async fn no_rows() {
                     table: String::new(),
                     column: "a".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 w.start(&cols[..]).await?.finish().await
             }
@@ -518,8 +662,10 @@ async fn empty_on_drop() {
                     table: String::new(),
                     column: "a".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let row_writer = w.start(&cols[..]).await?;
                 row_writer.finish().await
@@ -546,8 +692,10 @@ async fn it_queries_nulls() {
                     table: String::new(),
                     column: "a".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let mut w = w.start(cols).await?;
                 w.write_col(None::<i16>)?;
@@ -577,8 +725,10 @@ async fn it_queries() {
                     table: String::new(),
                     column: "a".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let mut w = w.start(cols).await?;
                 w.write_col(1024i16)?;
@@ -609,15 +759,19 @@ async fn it_queries_many_rows() {
                         table: String::new(),
                         column: "a".to_owned(),
                         collen: 0,
+                        charset: None,
                         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                         colflags: myc::constants::ColumnFlags::empty(),
+                        decimals: None,
                     },
                     Column {
                         table: String::new(),
                         column: "b".to_owned(),
                         collen: 0,
+                        charset: None,
                         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                         colflags: myc::constants::ColumnFlags::empty(),
+                        decimals: None,
                     },
                 ];
                 let mut w = w.start(cols).await?;
@@ -652,16 +806,20 @@ async fn it_prepares() {
         table: String::new(),
         column: "a".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
         table: String::new(),
         column: "c".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
 
     TestingShim::new(
@@ -710,50 +868,64 @@ async fn insert_exec() {
             table: String::new(),
             column: "username".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "email".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "pw".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "created".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_DATETIME,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "session".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "rss".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "mail".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
 
@@ -857,16 +1029,20 @@ async fn send_long() {
         table: String::new(),
         column: "a".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
         table: String::new(),
         column: "c".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_BLOB,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
 
     TestingShim::new(
@@ -915,15 +1091,19 @@ async fn it_prepares_many() {
             table: String::new(),
             column: "a".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "b".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
     let cols2 = cols.clone();
@@ -973,16 +1153,20 @@ async fn prepared_empty() {
         table: String::new(),
         column: "a".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
         table: String::new(),
         column: "c".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
 
     TestingShim::new(
@@ -1013,8 +1197,10 @@ async fn prepared_no_params() {
         table: String::new(),
         column: "a".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![];
@@ -1053,15 +1239,19 @@ async fn prepared_nulls() {
             table: String::new(),
             column: "a".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "b".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
     let cols2 = cols.clone();
@@ -1070,15 +1260,19 @@ async fn prepared_nulls() {
             table: String::new(),
             column: "c".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
             table: String::new(),
             column: "d".to_owned(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
 
@@ -1129,8 +1323,10 @@ async fn prepared_no_rows() {
         table: String::new(),
         column: "a".to_owned(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     TestingShim::new(
@@ -1199,8 +1395,10 @@ async fn large_packet() {
                     table: String::new(),
                     column: "a".to_owned(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_BLOB,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let mut row_writer = w.start(&cols).await?;
                 let blob_col = vec![0; U24_MAX + 1];
@@ -1246,22 +1444,28 @@ async fn ok_packet_with_info_when_session_track_disabled() {
                                 table: String::new(),
                                 column: "@@max_allowed_packet".to_owned(),
                                 collen: 0,
+                                charset: None,
                                 coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                 colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                                decimals: None,
                             },
                             Column {
                                 table: String::new(),
                                 column: "@@wait_timeout".to_owned(),
                                 collen: 0,
+                                charset: None,
                                 coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                 colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                                decimals: None,
                             },
                             Column {
                                 table: String::new(),
                                 column: "@@socket".to_owned(),
                                 collen: 0,
+                                charset: None,
                                 coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                                 colflags: myc::constants::ColumnFlags::empty(),
+                                decimals: None,
                             },
                         ];
 
@@ -1277,8 +1481,10 @@ async fn ok_packet_with_info_when_session_track_disabled() {
                             table: String::new(),
                             column: "@@version_comment".to_owned(),
                             collen: 0,
+                            charset: None,
                             coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                             colflags: myc::constants::ColumnFlags::empty(),
+                            decimals: None,
                         }];
 
                         let mut row_writer = w.start(cols).await?;

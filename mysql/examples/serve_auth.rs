@@ -64,8 +64,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
             table: String::new(),
             column: "abc".to_string(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
             colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+            decimals: None,
         }];
 
         let mut w = results.start(cols).await?;

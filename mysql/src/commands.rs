@@ -26,6 +26,7 @@ pub struct ClientHandshake {
     pub(crate) username: Option<Vec<u8>>,
     pub(crate) auth_response: Vec<u8>,
     pub(crate) auth_plugin: Vec<u8>,
+    pub(crate) connection_attrs: Vec<(String, String)>,
 }
 
 #[allow(clippy::branches_sharing_code)]
@@ -58,6 +59,7 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                     db: None,
                     auth_response: vec![],
                     auth_plugin: vec![],
+                    connection_attrs: Vec::new(),
                 },
             ));
         }
@@ -100,6 +102,13 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 (i, &b""[..])
             };
 
+        let (i, connection_attrs) =
+            if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_ATTRS) && !i.is_empty() {
+                parse_connection_attrs(i)?
+            } else {
+                (i, Vec::new())
+            };
+
         Ok((
             i,
             ClientHandshake {
@@ -110,6 +119,7 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 db: db.map(|c| c.to_vec()),
                 auth_response: auth_response.to_vec(),
                 auth_plugin: auth_plugin.to_vec(),
+                connection_attrs,
             },
         ))
     } else {
@@ -143,9 +153,31 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 db: db.map(|c| c.to_vec()),
                 auth_response: auth_response.to_vec(),
                 auth_plugin: vec![],
+                connection_attrs: Vec::new(),
             },
         ))
     }
+}
+
+fn parse_length_encoded_bytes(i: &[u8]) -> nom::IResult<&[u8], &[u8]> {
+    let (i, size) = read_length_encoded_number(i)?;
+    nom::bytes::complete::take(size)(i)
+}
+
+fn parse_connection_attrs(i: &[u8]) -> nom::IResult<&[u8], Vec<(String, String)>> {
+    let (i, size) = read_length_encoded_number(i)?;
+    let (remaining, mut attrs_bytes) = nom::bytes::complete::take(size)(i)?;
+    let mut attrs = Vec::new();
+    while !attrs_bytes.is_empty() {
+        let (rest, key) = parse_length_encoded_bytes(attrs_bytes)?;
+        let (rest, value) = parse_length_encoded_bytes(rest)?;
+        attrs.push((
+            String::from_utf8_lossy(key).into_owned(),
+            String::from_utf8_lossy(value).into_owned(),
+        ));
+        attrs_bytes = rest;
+    }
+    Ok((remaining, attrs))
 }
 
 fn read_length_encoded_number(i: &[u8]) -> nom::IResult<&[u8], u64> {

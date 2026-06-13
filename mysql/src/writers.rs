@@ -26,6 +26,10 @@ const BIN_GENERAL_CI: u16 = 0x3f;
 fn column_charset(column: &Column) -> u16 {
     use crate::myc::constants::UTF8_GENERAL_CI;
 
+    if let Some(charset) = column.charset {
+        return charset;
+    }
+
     if column
         .colflags
         .intersects(ColumnFlags::BINARY_FLAG | ColumnFlags::BLOB_FLAG)
@@ -178,7 +182,7 @@ where
         w.write_u32::<LittleEndian>(column_length)?;
         w.write_u8(c.coltype as u8)?;
         w.write_u16::<LittleEndian>(c.colflags.bits())?;
-        w.write_all(&[0x00])?; // decimals
+        w.write_all(&[c.decimals.unwrap_or(0)])?; // decimals
         w.write_all(&[0x00, 0x00])?; // unused
 
         if is_com_field_list {
@@ -307,8 +311,10 @@ mod tests {
             table: "t".into(),
             column: "c".into(),
             collen: 0,
+            charset: None,
             coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
             colflags: ColumnFlags::empty(),
+            decimals: None,
         };
 
         assert_eq!(column_charset(&column), UTF8_GENERAL_CI);
@@ -320,8 +326,10 @@ mod tests {
             table: "t".into(),
             column: "c".into(),
             collen: 0,
+            charset: None,
             coltype: ColumnType::MYSQL_TYPE_LONG,
             colflags: ColumnFlags::empty(),
+            decimals: None,
         };
 
         assert_eq!(column_charset(&column), BIN_GENERAL_CI);
@@ -333,8 +341,10 @@ mod tests {
             table: "t".into(),
             column: "c".into(),
             collen: 0,
+            charset: None,
             coltype: ColumnType::MYSQL_TYPE_STRING,
             colflags: ColumnFlags::BINARY_FLAG,
+            decimals: None,
         };
 
         assert_eq!(column_charset(&column), BIN_GENERAL_CI);
@@ -346,8 +356,10 @@ mod tests {
             table: "t".into(),
             column: "c".into(),
             collen: 0,
+            charset: None,
             coltype: ColumnType::MYSQL_TYPE_BLOB,
             colflags: ColumnFlags::empty(),
+            decimals: None,
         };
 
         assert_eq!(column_charset(&column), BIN_GENERAL_CI);
@@ -359,8 +371,10 @@ mod tests {
             table: "t".into(),
             column: "c".into(),
             collen: 0,
+            charset: None,
             coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
             colflags: ColumnFlags::BLOB_FLAG,
+            decimals: None,
         };
 
         assert_eq!(column_charset(&column), BIN_GENERAL_CI);

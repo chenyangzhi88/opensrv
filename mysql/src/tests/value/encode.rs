@@ -106,8 +106,10 @@ mod roundtrip_bin {
                     table: String::new(),
                     column: String::new(),
                     collen: 0,
+                    charset: None,
                     coltype: $ct,
                     colflags: ColumnFlags::empty(),
+                    decimals: None,
                 };
 
                 if !$sig {

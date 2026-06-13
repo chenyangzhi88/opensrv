@@ -71,12 +71,18 @@ pub struct Column {
     /// Column length (in bytes) reported through COLUMN_DEFINITION41.
     /// 0 means "use default".
     pub collen: u32,
+    /// Optional character set/collation id reported through COLUMN_DEFINITION41.
+    /// None means "derive from type and flags".
+    pub charset: Option<u16>,
     /// This column's type>
     pub coltype: ColumnType,
     /// Any flags associated with this column.
     ///
     /// Of particular interest are `ColumnFlags::UNSIGNED_FLAG` and `ColumnFlags::NOT_NULL_FLAG`.
     pub colflags: ColumnFlags,
+    /// Optional decimals byte reported through COLUMN_DEFINITION41.
+    /// None means "0".
+    pub decimals: Option<u8>,
 }
 
 /// QueryStatusInfo represents the status of a query.
@@ -160,6 +166,30 @@ pub trait AsyncMysqlShim<W: Send> {
         true
     }
 
+    /// Base capabilities supported by the protocol layer before shim-specific additions.
+    fn base_capabilities(&self) -> CapabilityFlags {
+        CapabilityFlags::CLIENT_PROTOCOL_41
+            | CapabilityFlags::CLIENT_SECURE_CONNECTION
+            | CapabilityFlags::CLIENT_PLUGIN_AUTH
+            | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+            | CapabilityFlags::CLIENT_CONNECT_WITH_DB
+            | CapabilityFlags::CLIENT_SESSION_TRACK
+            | CapabilityFlags::CLIENT_DEPRECATE_EOF
+    }
+
+    /// Let a backend advertise additional capabilities that it can actually handle.
+    fn server_capabilities(&self, base: CapabilityFlags) -> CapabilityFlags {
+        base
+    }
+
+    /// Called after the client handshake has been parsed and before authentication completes.
+    fn on_client_capabilities(
+        &mut self,
+        _capabilities: CapabilityFlags,
+        _connection_attrs: &[(String, String)],
+    ) {
+    }
+
     /// Called when the client issues a request to prepare `query` for later execution.
     ///
     /// The provided [`StatementMetaWriter`](struct.StatementMetaWriter.html) should be used to
@@ -198,6 +228,31 @@ pub trait AsyncMysqlShim<W: Send> {
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error>;
+
+    /// Return a LOCAL INFILE filename request for a query, if the backend supports it.
+    fn local_infile_request(&self, _query: &str) -> Option<String> {
+        None
+    }
+
+    /// Called before LOCAL INFILE data packets are streamed from the client.
+    async fn on_local_infile_start<'a>(&'a mut self, _query: &'a str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Called for each LOCAL INFILE data packet.
+    async fn on_local_infile_data<'a>(&'a mut self, _data: &'a [u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Called after the terminating empty LOCAL INFILE packet.
+    async fn on_local_infile_end<'a>(
+        &'a mut self,
+        _query: &'a str,
+        results: QueryResultWriter<'a, W>,
+    ) -> Result<(), Self::Error> {
+        let _ = results;
+        Ok(())
+    }
 
     /// Called when client switches database.
     async fn on_init<'a>(
@@ -245,6 +300,7 @@ pub struct ServerHandshakeConfig {
     pub connection_id: u32,
     pub default_auth_plugin: String,
     pub scramble: [u8; SCRAMBLE_SIZE],
+    pub server_capabilities: CapabilityFlags,
 }
 
 impl<B, R, W> AsyncMysqlIntermediary<B, R, W>
@@ -311,6 +367,7 @@ where
             connection_id: shim.connect_id(),
             default_auth_plugin: shim.default_auth_plugin().to_string(),
             scramble: shim.salt(),
+            server_capabilities: shim.server_capabilities(shim.base_capabilities()),
         };
 
         AsyncMysqlIntermediary::<B, R, W>::init_before_ssl_with_config(
@@ -344,13 +401,7 @@ where
         // connection_id (4 bytes)
         writer.write_all(&config.connection_id.to_le_bytes())?;
 
-        let server_capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
-            | CapabilityFlags::CLIENT_SECURE_CONNECTION
-            | CapabilityFlags::CLIENT_PLUGIN_AUTH
-            | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
-            | CapabilityFlags::CLIENT_CONNECT_WITH_DB
-            | CapabilityFlags::CLIENT_SESSION_TRACK
-            | CapabilityFlags::CLIENT_DEPRECATE_EOF;
+        let server_capabilities = config.server_capabilities;
 
         #[cfg(feature = "tls")]
         let server_capabilities = if tls_conf.is_some() {
@@ -506,6 +557,10 @@ where
             }
 
             self.client_capabilities = handshake.capabilities;
+            self.shim.on_client_capabilities(
+                handshake.capabilities,
+                handshake.connection_attrs.as_slice(),
+            );
             let mut auth_response = handshake.auth_response.clone();
             if let Some(username) = &handshake.username {
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
@@ -619,7 +674,40 @@ where
                 Ok(cmd) => {
                     match cmd.1 {
                         Command::Query(q) => {
-                            if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
+                            let query = ::std::str::from_utf8(q)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                                .to_string();
+                            let query = query.as_str();
+                            if let Some(filename) = self.shim.local_infile_request(query) {
+                                self.writer.write_all(&[0xfb])?;
+                                self.writer.write_all(filename.as_bytes())?;
+                                self.writer.end_packet().await?;
+                                self.writer.flush_all().await?;
+
+                                self.shim.on_local_infile_start(query).await?;
+                                let mut last_local_infile_seq;
+                                loop {
+                                    let (packet_seq, packet) =
+                                        self.reader.next_async().await?.ok_or_else(|| {
+                                            io::Error::new(
+                                                io::ErrorKind::ConnectionAborted,
+                                                "peer terminated connection during LOCAL INFILE",
+                                            )
+                                        })?;
+                                    last_local_infile_seq = packet_seq;
+                                    if packet.is_empty() {
+                                        break;
+                                    }
+                                    self.shim.on_local_infile_data(&packet).await?;
+                                }
+                                self.writer.set_seq(last_local_infile_seq + 1);
+                                let w = QueryResultWriter::new(
+                                    &mut self.writer,
+                                    false,
+                                    self.client_capabilities,
+                                );
+                                self.shim.on_local_infile_end(query, w).await?;
+                            } else if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     false,
@@ -632,8 +720,10 @@ where
                                     table: String::new(),
                                     column: String::from_utf8_lossy(var_with_at).to_string(),
                                     collen: 0,
+                                    charset: None,
                                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                                    decimals: None,
                                 }];
 
                                 match var {
@@ -643,14 +733,7 @@ where
                                         w.finish().await?;
                                     }
                                     _ => {
-                                        self.shim
-                                            .on_query(
-                                                ::std::str::from_utf8(q).map_err(|e| {
-                                                    io::Error::new(io::ErrorKind::InvalidData, e)
-                                                })?,
-                                                w,
-                                            )
-                                            .await?;
+                                        self.shim.on_query(query, w).await?;
                                     }
                                 }
                             } else if !self.process_use_statement_on_query
@@ -670,14 +753,7 @@ where
                                     false,
                                     self.client_capabilities,
                                 );
-                                self.shim
-                                    .on_query(
-                                        ::std::str::from_utf8(q).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?,
-                                        w,
-                                    )
-                                    .await?;
+                                self.shim.on_query(query, w).await?;
                             }
                         }
                         Command::Prepare(q) => {
