@@ -14,6 +14,8 @@
 
 use crate::myc::constants::{CapabilityFlags, Command as CommandByte};
 
+type ConnectionAttributes = Vec<(Vec<u8>, Vec<u8>)>;
+
 #[derive(Debug)]
 pub struct ClientHandshake {
     #[allow(dead_code)]
@@ -26,12 +28,16 @@ pub struct ClientHandshake {
     pub(crate) username: Option<Vec<u8>>,
     pub(crate) auth_response: Vec<u8>,
     pub(crate) auth_plugin: Vec<u8>,
-    pub(crate) connection_attrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) connection_attrs: ConnectionAttributes,
     pub(crate) zstd_compression_level: Option<u8>,
 }
 
 #[allow(clippy::branches_sharing_code)]
-pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], ClientHandshake> {
+pub fn client_handshake(
+    i: &[u8],
+    after_tls: bool,
+    server_capabilities: CapabilityFlags,
+) -> nom::IResult<&[u8], ClientHandshake> {
     // mysql handshake protocol documentation
     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
     let (i, cap) = nom::number::complete::le_u16(i)?;
@@ -104,7 +110,11 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 (i, &b""[..])
             };
 
-        let (i, connection_attrs) = if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_ATTRS)
+        // libmysqlclient may keep CONNECT_ATTRS in its flags even when the
+        // server does not advertise it. Its send_client_connect_attrs writes
+        // the field only when the server supports it; do not invent that field.
+        let (i, connection_attrs) = if (capabilities & server_capabilities)
+            .contains(CapabilityFlags::CLIENT_CONNECT_ATTRS)
         {
             parse_connection_attrs(i)?
         } else {
@@ -178,7 +188,7 @@ fn parse_length_encoded_bytes(i: &[u8]) -> nom::IResult<&[u8], &[u8]> {
     nom::bytes::complete::take(size)(i)
 }
 
-fn parse_connection_attrs(i: &[u8]) -> nom::IResult<&[u8], Vec<(Vec<u8>, Vec<u8>)>> {
+fn parse_connection_attrs(i: &[u8]) -> nom::IResult<&[u8], ConnectionAttributes> {
     let (i, size) = read_length_encoded_number(i)?;
     if size > 65_535 {
         return Err(nom::Err::Failure(nom::error::Error::new(

@@ -17,10 +17,10 @@ use crate::U24_MAX;
 
 #[test]
 fn test_one_ping() {
-    assert_eq!(
-        onepacket((&[0x01, 0, 0, 0, 0x10][..]).into()).unwrap().1,
-        (0, (&[0x10][..]).into())
-    );
+    let (rest, (sequence, payload)) = packet((&[0x01, 0, 0, 0, 0x10][..]).into()).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(sequence, 0);
+    assert_eq!(payload.as_ref(), &[0x10]);
 }
 
 #[test]

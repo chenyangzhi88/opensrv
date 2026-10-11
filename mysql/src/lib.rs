@@ -112,11 +112,11 @@ fn format_statistics(facts: StatisticsSnapshot, bytes: &mut [u8; 249]) -> io::Re
     let mut text = Text { bytes, length: 0 };
     // sql_parse.cc uses unsigned longlong multiplication and casts the
     // quotient to uint; preserve those widths instead of an f64 approximation.
-    let qps1000 = if facts.uptime == 0 {
-        0
-    } else {
-        facts.questions.wrapping_mul(1000) / facts.uptime
-    };
+    let qps1000 = facts
+        .questions
+        .wrapping_mul(1000)
+        .checked_div(facts.uptime)
+        .unwrap_or(0);
     std::fmt::write(
         &mut text,
         format_args!(
@@ -1316,7 +1316,7 @@ where
                 )
             })?;
 
-        let handshake = commands::client_handshake(&handshake, false)
+        let handshake = commands::client_handshake(&handshake, false, server_capabilities)
             .map_err(|e| match e {
                 nom::Err::Incomplete(_) => io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1345,8 +1345,7 @@ where
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "client requested SSL despite us not advertising support for it",
-            )
-            .into());
+            ));
         }
 
         #[cfg(feature = "tls")]
@@ -1380,7 +1379,7 @@ where
                 })?;
             seq = _seq;
 
-            handshake = commands::client_handshake(&hs, true)
+            handshake = commands::client_handshake(&hs, true, self.client_capabilities)
                 .map_err(|e| match e {
                     nom::Err::Incomplete(_) => io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -1492,8 +1491,7 @@ where
                         true,
                         client_plugin,
                         &scramble,
-                        &handshake.auth_response,
-                        seq,
+                        (seq, &handshake.auth_response),
                     )
                     .await?;
                 let authenticated = self
@@ -1610,9 +1608,9 @@ where
         initial_handshake: bool,
         client_plugin: Option<&str>,
         salt: &[u8],
-        initial_response: &[u8],
-        mut seq: u8,
+        initial_packet: (u8, &[u8]),
     ) -> Result<(bool, u8, bool), B::Error> {
+        let (mut seq, initial_response) = initial_packet;
         let expected = self
             .shim
             .auth_plugin_for_username(username, character_set, initial_handshake)
@@ -2388,7 +2386,6 @@ where
                                 stmt,
                                 &params,
                                 state,
-                                named,
                                 flags,
                                 admission,
                                 &mut command_started,
@@ -2571,8 +2568,7 @@ where
                                     false,
                                     request.plugin,
                                     &salt,
-                                    request.auth_data,
-                                    seq,
+                                    (seq, request.auth_data),
                                 )
                                 .await?;
                             let authenticated = self
@@ -2796,11 +2792,13 @@ where
         stmt: u32,
         raw_params: &bytes::Bytes,
         state: &mut StatementData,
-        named: bool,
         flags: u8,
         admission: Option<CommandAllocationAdmission>,
         command_started: &mut bool,
     ) -> Result<(), B::Error> {
+        let named = self
+            .client_capabilities
+            .contains(CapabilityFlags::CLIENT_QUERY_ATTRIBUTES);
         // Native STMT_ERROR is sticky until RESET/CLOSE. Packet framing and
         // the actual parameter setter still precede that execution gate.
         let deferred_error = state.long_data_error;

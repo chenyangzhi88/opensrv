@@ -374,9 +374,9 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
 
     /// Send cursor metadata without row data after COM_STMT_EXECUTE while preserving the current
     /// server transaction state.
-    pub async fn cursor_open<'columns>(
+    pub async fn cursor_open(
         mut self,
-        columns: &'columns [Column],
+        columns: &[Column],
         mut response: OkResponse,
     ) -> io::Result<()> {
         self.finalize(true).await?;

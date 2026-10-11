@@ -60,8 +60,7 @@ async fn original_sha2_switch_and_full_auth_keep_the_same_packet_charset() {
                 false,
                 Some("different_plugin"),
                 b"salt",
-                b"ignored",
-                0,
+                (0, b"ignored"),
             )
             .await
             .unwrap();
@@ -158,8 +157,7 @@ async fn authentication_switch_checks_the_actual_outgoing_packet_sequence_before
                     false,
                     Some("wrong_plugin"),
                     b"salt",
-                    b"ignored",
-                    previous,
+                    (previous, b"ignored"),
                 )
                 .await;
             if valid {
@@ -268,6 +266,8 @@ fn change_user_rejects_truncation_missing_attributes_and_trailing_bytes() {
     );
 }
 
+type CharsetObservation = (&'static str, u16, bool);
+
 #[derive(Clone)]
 struct AuthShim {
     plugin: &'static str,
@@ -277,7 +277,7 @@ struct AuthShim {
     cleartext_calls: Arc<AtomicUsize>,
     result_calls: Arc<AtomicUsize>,
     result_allowed: bool,
-    charsets: Arc<Mutex<Vec<(&'static str, u16, bool)>>>,
+    charsets: Arc<Mutex<Vec<CharsetObservation>>>,
 }
 
 #[async_trait]
@@ -403,11 +403,11 @@ fn framed(seq: u8, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn auth_intermediary<'a>(
+fn auth_intermediary(
     shim: AuthShim,
-    input: &'a [u8],
+    input: &[u8],
     secure_transport: bool,
-) -> AsyncMysqlIntermediary<AuthShim, &'a [u8], tokio::io::Sink> {
+) -> AsyncMysqlIntermediary<AuthShim, &[u8], tokio::io::Sink> {
     AsyncMysqlIntermediary {
         client_capabilities: CapabilityFlags::empty(),
         process_use_statement_on_query: false,
@@ -470,8 +470,7 @@ async fn authentication_exchange_switches_to_the_account_plugin_once() {
             false,
             Some("wrong_plugin"),
             b"salt",
-            b"ignored",
-            0,
+            (0, b"ignored"),
         )
         .await
         .unwrap();
@@ -492,8 +491,7 @@ async fn matching_plugin_empty_response_is_a_complete_failed_attempt() {
                 false,
                 Some("mysql_native_password"),
                 b"salt",
-                b"",
-                0,
+                (0, b""),
             )
             .await
             .unwrap(),
@@ -515,8 +513,7 @@ async fn caching_sha2_exchange_has_distinct_fast_and_tls_full_paths() {
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                b"\0",
-                0,
+                (0, b"\0"),
             )
             .await
             .unwrap(),
@@ -534,8 +531,7 @@ async fn caching_sha2_exchange_has_distinct_fast_and_tls_full_paths() {
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                b"fast",
-                0,
+                (0, b"fast"),
             )
             .await
             .unwrap(),
@@ -555,8 +551,7 @@ async fn caching_sha2_exchange_has_distinct_fast_and_tls_full_paths() {
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                b"",
-                0,
+                (0, b""),
             )
             .await
             .unwrap(),
@@ -577,8 +572,7 @@ async fn caching_sha2_exchange_has_distinct_fast_and_tls_full_paths() {
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                b"wrong",
-                0,
+                (0, b"wrong"),
             )
             .await
             .unwrap(),
@@ -600,8 +594,7 @@ async fn caching_sha2_exchange_has_distinct_fast_and_tls_full_paths() {
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                b"cache-miss",
-                0,
+                (0, b"cache-miss"),
             )
             .await
             .unwrap(),
@@ -623,8 +616,7 @@ async fn caching_sha2_exchange_has_distinct_fast_and_tls_full_paths() {
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                b"cached-response",
-                0,
+                (0, b"cached-response"),
             )
             .await
             .unwrap(),
@@ -649,8 +641,7 @@ async fn empty_sha2_password_distinguishes_handshake_proof_from_change_user_prob
                     true,
                     Some("caching_sha2_password"),
                     b"salt",
-                    &[0],
-                    0,
+                    (0, &[0]),
                 )
                 .await
                 .unwrap(),
@@ -675,8 +666,7 @@ async fn empty_sha2_password_distinguishes_handshake_proof_from_change_user_prob
                     false,
                     Some("caching_sha2_password"),
                     b"salt",
-                    b"",
-                    0,
+                    (0, b""),
                 )
                 .await
                 .unwrap(),
@@ -693,8 +683,7 @@ async fn empty_sha2_password_distinguishes_handshake_proof_from_change_user_prob
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                &[0],
-                0,
+                (0, &[0]),
             )
             .await
             .unwrap(),
@@ -720,8 +709,7 @@ async fn change_user_probe_never_accepts_a_wrong_password_for_an_empty_password_
                 false,
                 Some("caching_sha2_password"),
                 b"salt",
-                b"",
-                0,
+                (0, b""),
             )
             .await
             .unwrap(),

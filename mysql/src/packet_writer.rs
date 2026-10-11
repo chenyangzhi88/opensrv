@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use byteorder::{ByteOrder, LittleEndian};
-use flate2::{Compression, write::ZlibEncoder};
+use flate2::{write::ZlibEncoder, Compression};
 use std::io;
-use std::io::IoSlice;
 use std::io::prelude::*;
+use std::io::IoSlice;
 
-use crate::U24_MAX;
 use crate::packet_reader::CompressionAlgorithm;
+use crate::U24_MAX;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// The writer of mysql packet.

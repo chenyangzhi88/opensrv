@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use pin_project_lite::pin_project;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
 use tokio_rustls::server::TlsStream;
-use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
 use crate::commands::ClientHandshake;
 use crate::myc::constants::CapabilityFlags;

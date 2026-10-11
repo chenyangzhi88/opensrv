@@ -2,8 +2,8 @@ use crate::packet_writer::PacketWriter;
 use crate::{NetworkSettings, NetworkSettingsSnapshot};
 use std::io::{self, Write};
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite};

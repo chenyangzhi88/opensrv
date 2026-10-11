@@ -19,6 +19,50 @@ use crate::myc::constants::{CapabilityFlags, UTF8_GENERAL_CI};
 use crate::packet_reader::PacketReader;
 
 #[test]
+fn handshake_attributes_are_required_only_when_both_peers_support_them() {
+    for after_tls in [false, true] {
+        for client_supports in [false, true] {
+            for server_supports in [false, true] {
+                let mut client =
+                    CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+                client.set(CapabilityFlags::CLIENT_CONNECT_ATTRS, client_supports);
+                let mut server =
+                    CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+                server.set(CapabilityFlags::CLIENT_CONNECT_ATTRS, server_supports);
+                let mut input = client.bits().to_le_bytes().to_vec();
+                input.extend_from_slice(&1024u32.to_le_bytes());
+                input.push(45);
+                input.extend_from_slice(&[0; 23]);
+                input.extend_from_slice(b"login\0\0mysql_native_password\0");
+                if client_supports && server_supports {
+                    assert!(
+                        client_handshake(&input, after_tls, server).is_err(),
+                        "negotiated attributes require the real length byte"
+                    );
+                    input.extend_from_slice(&[4, 1, b'k', 1, b'v']);
+                }
+                let (remaining, handshake) = client_handshake(&input, after_tls, server).unwrap();
+                assert!(remaining.is_empty());
+                assert_eq!(
+                    handshake.capabilities, client,
+                    "retain original client flags independently from field negotiation"
+                );
+                assert_eq!(handshake.username.as_deref(), Some(b"login".as_slice()));
+                assert_eq!(handshake.auth_plugin, b"mysql_native_password");
+                assert_eq!(
+                    handshake.connection_attrs,
+                    if client_supports && server_supports {
+                        vec![(b"k".to_vec(), b"v".to_vec())]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn zstd_level_receipt_preserves_missing_and_invalid_bytes_without_inventing_a_default() {
     for declared in [false, true] {
         for level in [None, Some(0), Some(1), Some(22), Some(23), Some(255)] {
@@ -32,7 +76,7 @@ fn zstd_level_receipt_preserves_missing_and_invalid_bytes_without_inventing_a_de
             if let Some(level) = level {
                 bytes.push(level);
             }
-            let (remaining, handshake) = client_handshake(&bytes, false).unwrap();
+            let (remaining, handshake) = client_handshake(&bytes, false, capabilities).unwrap();
             assert_eq!(
                 handshake.zstd_compression_level,
                 if declared { level } else { None }
@@ -71,7 +115,7 @@ fn protocol41_auth_encodings_keep_database_plugin_and_attributes_at_the_actual_b
             input.extend_from_slice(password);
             input.extend_from_slice(b"database\0mysql_native_password\0");
             input.extend_from_slice(&[4, 1, b'k', 1, b'v']);
-            let (tail, handshake) = client_handshake(&input, false).unwrap();
+            let (tail, handshake) = client_handshake(&input, false, capabilities).unwrap();
             assert!(tail.is_empty());
             assert_eq!(handshake.username.as_deref(), Some(&b"login"[..]));
             assert_eq!(handshake.auth_response, password);
@@ -91,13 +135,13 @@ fn protocol41_auth_encodings_keep_database_plugin_and_attributes_at_the_actual_b
     input.push(45);
     input.extend_from_slice(&[0; 23]);
     input.extend_from_slice(b"login\0");
-    assert!(client_handshake(&input, false).is_err());
+    assert!(client_handshake(&input, false, base).is_err());
     input.push(10);
     input.extend_from_slice(b"short");
-    assert!(client_handshake(&input, false).is_err());
+    assert!(client_handshake(&input, false, base).is_err());
     input.truncate(38);
     input.push(0);
-    assert!(client_handshake(&input, false).is_err());
+    assert!(client_handshake(&input, false, base).is_err());
 
     let password = vec![b'a'; 300];
     let capabilities = base | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
@@ -110,7 +154,7 @@ fn protocol41_auth_encodings_keep_database_plugin_and_attributes_at_the_actual_b
     input.extend_from_slice(&password);
     input.extend_from_slice(b"database\0mysql_native_password\0");
     input.extend_from_slice(&[4, 1, b'k', 1, b'v']);
-    let (tail, handshake) = client_handshake(&input, false).unwrap();
+    let (tail, handshake) = client_handshake(&input, false, capabilities).unwrap();
     assert!(tail.is_empty());
     assert_eq!(handshake.auth_response, password);
     assert_eq!(handshake.db.as_deref(), Some(&b"database"[..]));
@@ -130,12 +174,12 @@ fn declared_connection_attributes_require_length_and_reject_native_64k_overflow(
     input.push(45);
     input.extend_from_slice(&[0; 23]);
     input.extend_from_slice(b"login\0\0mysql_native_password\0");
-    assert!(client_handshake(&input, false).is_err());
+    assert!(client_handshake(&input, false, capabilities).is_err());
     let boundary = input.len();
     input.extend_from_slice(&[0xfd, 0, 0, 1]);
     input.extend_from_slice(&vec![0; 65_536]);
     assert!(matches!(
-        client_handshake(&input, false),
+        client_handshake(&input, false, capabilities),
         Err(nom::Err::Failure(_))
     ));
     input.truncate(boundary);
@@ -143,7 +187,7 @@ fn declared_connection_attributes_require_length_and_reject_native_64k_overflow(
     // length-encoded value, no new table or opaque trailing padding.
     input.extend_from_slice(&[0xfc, 0xff, 0xff, 1, b'k', 0xfc, 0xfa, 0xff]);
     input.extend_from_slice(&vec![b'v'; 65_530]);
-    let (tail, handshake) = client_handshake(&input, false).unwrap();
+    let (tail, handshake) = client_handshake(&input, false, capabilities).unwrap();
     assert!(tail.is_empty());
     assert_eq!(
         handshake.connection_attrs,
@@ -166,28 +210,20 @@ fn it_parses_handshake() {
     let r = Cursor::new(&data[..]);
     let mut pr = PacketReader::new(r);
     let (_, p) = pr.next().unwrap().unwrap();
-    let (_, handshake) = client_handshake(&p, false).unwrap();
+    let (_, handshake) = client_handshake(&p, false, CapabilityFlags::all()).unwrap();
     println!("{handshake:?}");
-    assert!(
-        handshake
-            .capabilities
-            .contains(CapabilityFlags::CLIENT_LONG_PASSWORD)
-    );
-    assert!(
-        handshake
-            .capabilities
-            .contains(CapabilityFlags::CLIENT_MULTI_RESULTS)
-    );
-    assert!(
-        handshake
-            .capabilities
-            .contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB)
-    );
-    assert!(
-        handshake
-            .capabilities
-            .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
-    );
+    assert!(handshake
+        .capabilities
+        .contains(CapabilityFlags::CLIENT_LONG_PASSWORD));
+    assert!(handshake
+        .capabilities
+        .contains(CapabilityFlags::CLIENT_MULTI_RESULTS));
+    assert!(handshake
+        .capabilities
+        .contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB));
+    assert!(handshake
+        .capabilities
+        .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF));
     assert_eq!(handshake.collation, UTF8_GENERAL_CI);
     assert_eq!(handshake.username, Some(b"default"[..].to_vec()));
     assert_eq!(handshake.maxps, 16777216);

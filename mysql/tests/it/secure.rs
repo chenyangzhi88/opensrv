@@ -86,34 +86,21 @@ mod tls {
         Ok(config)
     }
 
-    pub async fn serve_on(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let (mut r, mut w) = stream.into_split();
-
-            tokio::spawn(async move {
-                let tls_config = setup_tls().unwrap();
-                let tls_config = Arc::new(tls_config);
-                let mut shim = Backend;
-                let ops = IntermediaryOptions::default();
-
-                let (is_ssl, init_params) = opensrv_mysql::AsyncMysqlIntermediary::init_before_ssl(
-                    &mut shim,
-                    &mut r,
-                    &mut w,
-                    &Some(tls_config.clone()),
-                )
-                .await
-                .unwrap();
-
-                if is_ssl {
-                    opensrv_mysql::secure_run_with_options(shim, w, ops, tls_config, init_params)
-                        .await
-                } else {
-                    opensrv_mysql::plain_run_with_options(shim, w, ops, init_params).await
-                }
-            });
-        }
+    pub async fn serve_on(listener: TcpListener) -> io::Result<()> {
+        let (stream, _) = listener.accept().await?;
+        let (mut r, mut w) = stream.into_split();
+        let tls_config = Arc::new(setup_tls()?);
+        let mut shim = Backend;
+        let ops = IntermediaryOptions::default();
+        let (is_ssl, init_params) = opensrv_mysql::AsyncMysqlIntermediary::init_before_ssl(
+            &mut shim,
+            &mut r,
+            &mut w,
+            &Some(tls_config.clone()),
+        )
+        .await?;
+        assert!(is_ssl, "the integration client must actually negotiate TLS");
+        opensrv_mysql::secure_run_with_options(shim, w, ops, tls_config, init_params).await
     }
 }
 
@@ -131,11 +118,7 @@ async fn test_secure() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
-    tokio::spawn(async move {
-        let _ = tls::serve_on(listener).await;
-    });
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let server = tokio::spawn(tls::serve_on(listener));
 
     let mut echo_output = Command::new("echo")
         .arg("\"SELECT * FROM foo\"")
@@ -168,6 +151,9 @@ async fn test_secure() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()?;
 
     let status = mysql_ssl.wait()?;
+    // Propagate the actual server-side handshake/command result as well as
+    // the client exit status; a detached worker panic must not be lost.
+    tokio::time::timeout(Duration::from_secs(10), server).await???;
     assert_eq!(status.into_raw(), 0);
 
     Ok(())

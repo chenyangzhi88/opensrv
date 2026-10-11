@@ -21,16 +21,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
-use mysql_async::Opts;
 use mysql_async::prelude::*;
+use mysql_async::Opts;
 use mysql_common as myc;
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, Column, ErrorKind, InitWriter,
     OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, U24_MAX,
 };
 use tokio::io::BufWriter;
-use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::TcpListener;
 
 async fn raw_auth_read_packet(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
     use tokio::io::AsyncReadExt;
@@ -361,10 +361,12 @@ async fn it_pings() {
     .await;
 }
 
+type AuthenticationName = (Vec<u8>, u16, bool);
+
 struct InitCountingShim {
     on_init_called: Arc<AtomicBool>,
     databases: Arc<Mutex<Vec<Vec<u8>>>>,
-    names: Arc<Mutex<Vec<(Vec<u8>, u16, bool)>>>,
+    names: Arc<Mutex<Vec<AuthenticationName>>>,
 }
 
 #[async_trait]

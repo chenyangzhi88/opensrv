@@ -18,8 +18,8 @@ contain local differences. Another equally matching candidate,
 The selected maintenance baseline is therefore reproducible, not a claim that
 the exact original checkout commit can be uniquely inferred.
 
-All 39 current package files, including sources, tests, examples, manifest,
-README and TLS fixtures, are retained byte-for-byte. There are 24 modified
+At the migration commit, all 39 input package files, including sources, tests,
+examples, manifest, README and TLS fixtures, were retained byte-for-byte. There are 24 modified
 upstream files and 10 added files. Their sorted path/checksum inventory digest is
 `361820aac1bcce3e6b6822ff343e2b84e41b7f7d2cbe7965dd67aa3667e8d8c8`.
 
@@ -31,7 +31,7 @@ parsing and allocation ownership, query attributes, authentication/TLS and
 session information, compressed packet streams, packet limits and boundaries,
 prepared/cursor/long-data handling, local infile, result/status/error metadata,
 value codecs, and their tests/examples. This migration introduces no new wire
-behavior and does not claim every contract currently passes.
+behavior. The follow-up repair below is distinct from that byte-preserving migration.
 
 Shared packet, authentication and command-state code depends on the same
 backend interface. It is retained as one complete functional commit rather
@@ -55,22 +55,58 @@ Product test runners select only `-p opensrv-mysql` using this workspace's
 manifest from the parent working directory. The original toolchain file is
 untouched. Actual migration checks used Rust 1.95.0.
 
-## Actual checks and existing failures
+## Follow-up repairs and recorded checks (2026-10-11)
 
-- Product dependency `cargo check --locked --offline -p opensrv-mysql --lib` passed.
-- Library tests: 282 passed, 8 failed. The old-copy diagnostic rerun reproduced
-  exactly the same 8 failing tests.
-- Client integration tests: 27 passed, 1 failed (`secure::test_secure`, `256 != 0`).
-  The old-copy targeted diagnostic reproduced the same failure.
-- Source-evidence utility: 25 tests passed; Classic producer selection: 2 passed.
-- Formatting and strict Clippy checks failed on retained existing code.
-- The changed-path architecture text check failed on a pre-existing literal
-  `.execute_prepared_sql(` expectation; the current Classic implementation
-  uses a publishing entry point. Its assertion was not rewritten to obtain PASS.
+The migration's historical results were 282/290 library tests, 27/28 integration
+tests, and failed format/strict-Clippy/old-architecture checks. The old copy
+reproduced the same test failures. Preserve that raw baseline at
+`/nvme_data_1/uni5db-opensrv-migration.eNvtms`; it is not the current result.
 
-No failed assertions were deleted, no workload was changed, and no opportunistic
-behavior repairs were included. This is a source migration, not full application
-certification, performance acceptance or a release.
+The authorized follow-up fixes:
+
+- Parse handshake connection attributes only when both peers advertise
+  `CLIENT_CONNECT_ATTRS`. libmysqlclient can retain that client bit while
+  omitting the field for a server without it. Preserve the original client
+  flags and all strict length/size checks for genuinely negotiated attributes.
+  Test both negotiation outcomes, both client-bit states and both TLS phases.
+- Align compression reply fixtures with the request's actual sequence, count
+  decoded commands separately from admission events, and forward the installed
+  named-query consumer in the frontier fixture. Assert the consumer's setter
+  ERR has exactly one existing query terminal, not an additional packet terminal.
+- Await the TLS server task and assert TLS was actually negotiated, retaining
+  the real command-line client's successful-exit assertion.
+- Remove the unused legacy single-packet decoder/buffer wrapper. Keep the
+  single live decoder and its packet tests. Clean strict Clippy findings without
+  blanket allowances, extra state, or changing the native statistics widths.
+- Update the parent architecture assertion to check the actual shared product
+  publishing, batch and cursor entries used by Classic/X.
+
+Recorded checks of the earlier frozen source:
+
+- All-features library tests: **291 passed, 0 failed, 0 ignored**.
+- All-features client integration: **28 passed, 0 failed, 0 ignored**.
+- Without default/TLS features: **290 library and 27 integration tests passed**.
+- Selected-package formatting and strict all-targets/all-features Clippy passed.
+- Strict all-targets Clippy without default/TLS features also passed.
+- Actual product dependency `cargo check --locked --offline -p opensrv-mysql --lib` passed.
+- Relevant parent architecture test: 1 passed; evidence utility: 25 passed;
+  Classic producer selection: 2 passed.
+
+Commands, exit codes, raw logs, final diffs and source checksums are in
+`/nvme_data_1/uni5db-opensrv-fixes.UCodRr`. Rust/Clippy 1.95.0 and the installed
+official MySQL CLI 8.0.46 were used. No dependencies or lockfiles were changed.
+These are selected MySQL development checks, not full product/application
+certification, performance acceptance or a release. ClickHouse was not tested.
+
+Subsequent checksum verification found that `mysql/src/lib.rs` no longer matches
+that run's `source-freeze.sha256`; the other 38 recorded files still match. The
+counts above are historical evidence, not verification of this later source.
+This local follow-up commit does not rerun the test matrix or publish a release.
+
+Follow-up repairs are recorded on `uni5db-0.8`; updating the parent gitlink is a
+separate parent-repository operation. This local commit does not push or open a
+PR. The migration inventory above describes the migration commit, not the
+intentionally changed repaired sources.
 
 ## Maintenance and upstream contributions
 

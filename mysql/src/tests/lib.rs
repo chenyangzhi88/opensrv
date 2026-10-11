@@ -14,6 +14,17 @@ use std::sync::{
 };
 use tokio::io::AsyncWrite;
 
+type Observations<T> = Arc<Mutex<Vec<T>>>;
+
+// Each request fixture consumed here occupies one compressed frame at sequence zero.
+// Its response continues that exchange at one, then the next request resets it.
+async fn command_reply<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut PacketReader<R>,
+) -> (u8, crate::packet_reader::Packet) {
+    reader.set_compressed_sequence(1);
+    reader.next_async_in_exchange(1).await.unwrap().unwrap()
+}
+
 #[tokio::test]
 async fn initial_database_rejection_flushes_one_error_closes_and_never_dispatches_buffered_commands(
 ) {
@@ -128,7 +139,8 @@ async fn initial_authentication_borrows_raw_names_and_packet_charset_at_every_or
         bytes.extend_from_slice(database);
         bytes.push(0);
         bytes.extend_from_slice(b"mysql_native_password\0");
-        let (remaining, handshake) = crate::commands::client_handshake(&bytes, false).unwrap();
+        let (remaining, handshake) =
+            crate::commands::client_handshake(&bytes, false, capabilities).unwrap();
         assert!(remaining.is_empty());
         assert_eq!(handshake.username.as_deref(), Some(username));
         assert_eq!(handshake.db.as_deref(), Some(database));
@@ -263,7 +275,7 @@ async fn change_user_raw_names_and_charset_survive_dispatch_compression_and_next
                     replies.enable_zstd_compression();
                 }
                 for _ in 0..reached {
-                    let (sequence, response) = replies.next_async().await.unwrap().unwrap();
+                    let (sequence, response) = command_reply(&mut replies).await;
                     assert_eq!(sequence, 1);
                     if error {
                         assert_eq!(
@@ -274,7 +286,7 @@ async fn change_user_raw_names_and_charset_survive_dispatch_compression_and_next
                         assert_eq!(response[0], 0);
                     }
                     if !error {
-                        let (sequence, ping) = replies.next_async().await.unwrap().unwrap();
+                        let (sequence, ping) = command_reply(&mut replies).await;
                         assert_eq!(sequence, 1);
                         assert_eq!(ping[0], 0);
                     }
@@ -339,12 +351,12 @@ struct FrontierShim {
     fail_sql: bool,
     init_databases: Arc<Mutex<Vec<Vec<u8>>>>,
     init_error: bool,
-    auth_names: Arc<Mutex<Vec<(&'static str, Vec<u8>, u16, Option<bool>)>>>,
-    changed_databases: Arc<Mutex<Vec<(Vec<u8>, Option<Vec<u8>>, u16)>>>,
+    auth_names: Observations<(&'static str, Vec<u8>, u16, Option<bool>)>,
+    changed_databases: Observations<(Vec<u8>, Option<Vec<u8>>, u16)>,
     rejected_charset: Option<u16>,
     change_user_error: bool,
     change_user_entries: Arc<AtomicUsize>,
-    change_user_errors: Arc<Mutex<Vec<(u16, [u8; 5], String)>>>,
+    change_user_errors: Observations<(u16, [u8; 5], String)>,
     change_user_entry_failure: bool,
     authentication_rejected: bool,
     authentication_error: Option<(u16, [u8; 5], String)>,
@@ -594,10 +606,14 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for FrontierShim {
     }
     async fn before_command_read(&mut self) -> io::Result<Option<(u16, [u8; 5], String)>> {
         let call = self.read_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        self.read_prior_commands
-            .lock()
-            .unwrap()
-            .push(self.command_frontiers.lock().unwrap().len());
+        self.read_prior_commands.lock().unwrap().push(
+            self.command_frontiers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, admission)| !admission)
+                .count(),
+        );
         if self.read_fail_at == Some(call) {
             return Err(io::Error::other("actual read-admission operational error"));
         }
@@ -775,6 +791,13 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for FrontierShim {
     ) -> io::Result<()> {
         <Shim as AsyncMysqlShim<W>>::on_query(&mut self.inner, sql, writer).await
     }
+    async fn on_query_bindings<'a>(
+        &'a mut self,
+        bindings: ParsedBindings<'a>,
+        writer: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        <Shim as AsyncMysqlShim<W>>::on_query_bindings(&mut self.inner, bindings, writer).await
+    }
 }
 fn long_data(id: u32, ordinal: u16, bytes: &[u8]) -> Vec<u8> {
     let mut command = vec![0x18];
@@ -933,7 +956,14 @@ async fn change_user_cleanup_operational_error_is_not_a_sql_err_or_an_auth_attem
 #[tokio::test]
 async fn change_user_native_field_and_attribute_failure_phases_close_after_exact_err() {
     use super::packet_reader::compression_frame;
-    let cases: Vec<(Vec<u8>, CapabilityFlags, u16, &[u8; 5], &[u8])> = vec![
+    type FailureCase = (
+        Vec<u8>,
+        CapabilityFlags,
+        u16,
+        &'static [u8; 5],
+        &'static [u8],
+    );
+    let cases: Vec<FailureCase> = vec![
         (
             b"\x11".to_vec(),
             CapabilityFlags::CLIENT_PROTOCOL_41,
@@ -1019,7 +1049,7 @@ async fn change_user_native_field_and_attribute_failure_phases_close_after_exact
             } else if compression == 2 {
                 replies.enable_zstd_compression();
             }
-            let (sequence, response) = replies.next_async().await.unwrap().unwrap();
+            let (sequence, response) = command_reply(&mut replies).await;
             let mut expected = vec![0xff];
             expected.extend(code.to_le_bytes());
             expected.push(b'#');
@@ -1225,7 +1255,7 @@ async fn read_admission_is_before_payload_and_retains_native_error_exchange_sequ
                 assert_eq!(
                     frontiers.lock().unwrap().as_slice(),
                     if prior_command {
-                        &[(0x0e, false)][..]
+                        &[(0x0e, false), (0x0e, true)][..]
                     } else {
                         &[]
                     }
@@ -1536,7 +1566,7 @@ async fn init_db_borrows_original_packet_bytes_and_backend_error_preserves_next_
                     reader.enable_zstd_compression();
                 }
                 for _ in databases {
-                    let (sequence, packet) = reader.next_async().await.unwrap().unwrap();
+                    let (sequence, packet) = command_reply(&mut reader).await;
                     assert_eq!(sequence, 1);
                     if init_error {
                         assert_eq!(
@@ -1546,7 +1576,7 @@ async fn init_db_borrows_original_packet_bytes_and_backend_error_preserves_next_
                     } else {
                         assert_eq!(packet.as_ref(), &[0, 0, 0, 0, 0, 0, 0]);
                     }
-                    let (sequence, packet) = reader.next_async().await.unwrap().unwrap();
+                    let (sequence, packet) = command_reply(&mut reader).await;
                     assert_eq!(sequence, 1);
                     assert_eq!(packet.as_ref(), &[0, 0, 0, 3, 0, 0, 0]);
                 }
@@ -1672,11 +1702,10 @@ fn statistics_integer_rendering_preserves_native_width_wrap_and_zero_uptime() {
                 flush_tables: u64::MAX,
                 open_tables: u32::MAX,
             };
-            let qps = if uptime == 0 {
-                0
-            } else {
-                questions.wrapping_mul(1000) / uptime
-            };
+            let qps = questions
+                .wrapping_mul(1000)
+                .checked_div(uptime)
+                .unwrap_or(0);
             let expected = format!(
                 "Uptime: {uptime}  Threads: -2147483648  Questions: {questions}  Slow queries: {}  Opens: {}  Flush tables: {}  Open tables: {}  Queries per second avg: {}.{:03}",
                 u64::MAX,
@@ -1749,11 +1778,11 @@ async fn statistics_is_one_text_or_error_packet_and_preserves_next_command_bound
                     _ => b"\xff\xd3\x04#42000COM_STATISTICS global producers are not installed",
                 };
                 for _ in 0..2 {
-                    let (sequence, packet) = reader.next_async().await.unwrap().unwrap();
+                    let (sequence, packet) = command_reply(&mut reader).await;
                     assert_eq!(sequence, 1);
                     assert_eq!(packet.as_ref(), expected);
                 }
-                let (sequence, packet) = reader.next_async().await.unwrap().unwrap();
+                let (sequence, packet) = command_reply(&mut reader).await;
                 assert_eq!(sequence, 1);
                 assert_eq!(packet.as_ref(), &[0, 0, 0, 3, 0, 0, 0]);
                 assert!(
@@ -1984,6 +2013,7 @@ async fn native_execute_packet_decode_precedes_ordinal_but_setter_errors_finish_
     let executions = Arc::clone(&shim.command_executions);
     let frontiers = Arc::clone(&shim.command_frontiers);
     let values = Arc::clone(&shim.values);
+    let query_finishes = Arc::clone(&shim.query_finishes);
     let mut input = frame(b"\x16SELECT ?");
     input.extend(execute(7, 8, &[1, 0, 1, 1])); // malformed native descriptor
     input.extend(execute(7, 8, &[0])); // complete N<P: dispatch then precheck
@@ -2007,11 +2037,13 @@ async fn native_execute_packet_decode_precedes_ordinal_but_setter_errors_finish_
             (0x17, false),
             (0x17, true),
             (0x17, false),
-            (0x17, true),
             (1, false),
             (1, true),
         ]
     );
+    // Setter errors are returned by the actual bindings consumer. Its SQL
+    // error response uses on_query_finished, never a second packet terminal.
+    assert_eq!(query_finishes.load(Ordering::SeqCst), 1);
     assert!(
         values.lock().unwrap().is_empty(),
         "no fake parameter VALUE after setter failure"
@@ -2490,15 +2522,7 @@ async fn deferred_setter_allocation_failure_is_operational_and_releases_actual_b
         };
         let params = bytes::Bytes::from_static(&[1, 1, 1, 254, 0, 0]);
         let error = intermediary
-            .run_execute_until_disconnect(
-                7,
-                &params,
-                &mut state,
-                true,
-                8,
-                Some(admission),
-                &mut false,
-            )
+            .run_execute_until_disconnect(7, &params, &mut state, 8, Some(admission), &mut false)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
@@ -2600,7 +2624,6 @@ async fn early_deferred_gate_retains_same_value_and_admission_until_actual_state
                     7,
                     &params,
                     &mut state,
-                    true,
                     8,
                     admission.clone(),
                     &mut false,
@@ -3021,7 +3044,8 @@ async fn negotiated_zstd_validates_the_actual_byte_before_authentication_and_kee
             if let Some(level) = level {
                 bytes.push(level);
             }
-            let (remaining, handshake) = crate::commands::client_handshake(&bytes, false).unwrap();
+            let (remaining, handshake) =
+                crate::commands::client_handshake(&bytes, false, capabilities).unwrap();
             assert!(remaining.is_empty());
             assert_eq!(handshake.zstd_compression_level, level);
             let shim = Shim::default();
@@ -3221,8 +3245,8 @@ struct Shim {
     block: bool,
     current: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
-    query: Arc<Mutex<Vec<(Vec<u8>, Vec<Slot>)>>>,
-    execute: Arc<Mutex<Vec<(u8, Vec<Slot>, i64)>>>,
+    query: Observations<(Vec<u8>, Vec<Slot>)>,
+    execute: Observations<(u8, Vec<Slot>, i64)>,
     cancel: Arc<AtomicUsize>,
     finish: Arc<AtomicUsize>,
     starts: Arc<AtomicUsize>,
@@ -3547,20 +3571,22 @@ async fn actual_query_envelope_strips_only_negotiated_framing_and_does_not_leak_
     input.extend(frame(&[1]));
     let mut output = Vec::new();
     run(shim, &input, &mut output, true).await.unwrap();
-    let rows = query_rows.lock().unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, b"USE db");
-    assert_eq!(
-        rows[0].1,
-        vec![Slot {
-            name: Some(b"a".to_vec()),
-            code: 1,
-            unsigned: false,
-            null: false,
-            bytes: vec![7]
-        }]
-    );
-    assert_eq!(rows[1], (b"SELECT 2".to_vec(), vec![]));
+    {
+        let rows = query_rows.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, b"USE db");
+        assert_eq!(
+            rows[0].1,
+            vec![Slot {
+                name: Some(b"a".to_vec()),
+                code: 1,
+                unsigned: false,
+                null: false,
+                bytes: vec![7]
+            }]
+        );
+        assert_eq!(rows[1], (b"SELECT 2".to_vec(), vec![]));
+    }
     assert_eq!(current.load(Ordering::SeqCst), 0);
     assert!(peak.load(Ordering::SeqCst) >= std::mem::size_of::<crate::RawParamValue<'_>>());
     assert_eq!(finish.load(Ordering::SeqCst), 2);
@@ -3608,27 +3634,29 @@ async fn execute_flag8_reset_and_reuse_share_only_actual_placeholder_source_type
     input.extend(frame(&[1]));
     let mut output = Vec::new();
     run(shim, &input, &mut output, true).await.unwrap();
-    let rows = observed.lock().unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, 9);
-    assert_eq!(rows[0].2, 7);
-    assert_eq!(rows[0].1.len(), 2);
-    assert_eq!(rows[0].1[0].name, Some(b"p".to_vec()));
-    assert_eq!(rows[0].1[1].name, Some(b"a".to_vec()));
-    assert_eq!(
-        rows[1],
-        (
-            8,
-            vec![Slot {
-                name: None,
-                code: 1,
-                unsigned: false,
-                null: false,
-                bytes: vec![11]
-            }],
-            11
-        )
-    );
+    {
+        let rows = observed.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 9);
+        assert_eq!(rows[0].2, 7);
+        assert_eq!(rows[0].1.len(), 2);
+        assert_eq!(rows[0].1[0].name, Some(b"p".to_vec()));
+        assert_eq!(rows[0].1[1].name, Some(b"a".to_vec()));
+        assert_eq!(
+            rows[1],
+            (
+                8,
+                vec![Slot {
+                    name: None,
+                    code: 1,
+                    unsigned: false,
+                    null: false,
+                    bytes: vec![11]
+                }],
+                11
+            )
+        );
+    }
     let errors = errors(&output).await;
     assert_eq!(errors.len(), 1);
     assert_eq!(
@@ -3935,5 +3963,7 @@ fn external_default_tls_callback_is_fallible_compatible_but_does_not_invent_sql_
     assert_eq!(shim.statistics_calls.load(Ordering::Relaxed), 0);
     assert_eq!(crate::TlsSessionInfo::NO_SSL.cipher, "");
     assert_eq!(crate::TlsSessionInfo::NO_SSL.version, "");
-    assert!(!crate::TlsSessionInfo::NO_SSL.reused);
+    const {
+        assert!(!crate::TlsSessionInfo::NO_SSL.reused);
+    }
 }

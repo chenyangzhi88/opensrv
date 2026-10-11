@@ -40,11 +40,6 @@ pub(crate) enum CompressionAlgorithm {
     Zstd,
 }
 
-/// Calculate the new buffer size for the next read
-fn calc_new_buf_size(last_buf_size: usize) -> usize {
-    calc_new_buf_size_with_minimum(last_buf_size, PACKET_BUFFER_SIZE)
-}
-
 fn calc_new_buf_size_with_minimum(last_buf_size: usize, minimum: usize) -> usize {
     if last_buf_size >= minimum * 2 {
         // if packet is already too large, use larger buffer to avoid multiple allocation
@@ -634,13 +629,6 @@ fn compressed_packet_too_large() -> io::Error {
         io::ErrorKind::InvalidData,
         "compressed MySQL packet exceeds max_allowed_packet",
     )
-}
-
-pub fn onepacket(i: NomBytes) -> nom::IResult<NomBytes, (u8, NomBytes)> {
-    let (i, length) = nom::number::complete::le_u24(i)?;
-    let (i, seq) = nom::bytes::complete::take(1u8)(i)?;
-    let (i, bytes) = nom::bytes::complete::take(length)(i)?;
-    Ok((i, (seq.as_ref()[0], bytes)))
 }
 
 /// Bytes wrapper for nom, allowing nom to parse bytes::Bytes
