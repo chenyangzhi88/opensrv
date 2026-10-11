@@ -2,5 +2,5 @@
 resolver = "2"
 members = ["clickhouse", "mysql", "components/micromarshal"]
 
-[patch.crates-io]
-subprocess = { git = "https://github.com/hniksic/rust-subprocess", tag = "release/0.2.9" }
+# Preserve the registry dependency used by Uni5DB's previous standalone MySQL
+# package. Do not adopt the upstream workspace's Git-only subprocess test patch.
