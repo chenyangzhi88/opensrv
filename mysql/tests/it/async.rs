@@ -17,20 +17,118 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use futures::FutureExt;
-use mysql_async::prelude::*;
+use futures::{FutureExt, StreamExt};
 use mysql_async::Opts;
+use mysql_async::prelude::*;
 use mysql_common as myc;
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ErrorKind, InitWriter, OkResponse, ParamParser,
-    QueryResultWriter, StatementMetaWriter, U24_MAX,
+    AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, Column, ErrorKind, InitWriter,
+    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, U24_MAX,
 };
 use tokio::io::BufWriter;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
+use tokio::net::tcp::OwnedWriteHalf;
+
+async fn raw_auth_read_packet(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; 4];
+    socket.read_exact(&mut header).await.unwrap();
+    let length =
+        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+    assert!(length <= 1024, "bounded actual fixture response");
+    let mut body = vec![0; length];
+    socket.read_exact(&mut body).await.unwrap();
+    (header[3], body)
+}
+
+async fn raw_auth_write_packet(socket: &mut tokio::net::TcpStream, sequence: u8, body: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let length = u32::try_from(body.len()).unwrap().to_le_bytes();
+    let frame = [&length[..3], &[sequence], body].concat();
+    // Actual TCP fragments, not a direct callback invocation.
+    for byte in frame {
+        socket.write_all(&[byte]).await.unwrap();
+    }
+    socket.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_initial_and_change_user_names_pass_through_real_tcp_handshake_and_dispatch() {
+    for (charset, user, database) in [
+        (8u8, &b"caf\xe9"[..], &b"db_\xe9"[..]),
+        (28, &b"gbk_\x81\x5c"[..], &b"db_\x81\x5c"[..]),
+        (45, &b"raw_\xff"[..], &b"db_\xc3"[..]),
+    ] {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let databases = Arc::new(Mutex::new(Vec::new()));
+        let shim = InitCountingShim {
+            on_init_called: Arc::new(AtomicBool::new(false)),
+            databases: Arc::clone(&databases),
+            names: Arc::clone(&names),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, writer) = socket.into_split();
+            AsyncMysqlIntermediary::run_on(shim, reader, BufWriter::new(writer))
+                .await
+                .unwrap();
+        });
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (sequence, greeting) = raw_auth_read_packet(&mut socket).await;
+        assert_eq!(sequence, 0);
+        assert_eq!(greeting[0], 10);
+        let capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
+            | CapabilityFlags::CLIENT_PLUGIN_AUTH
+            | CapabilityFlags::CLIENT_SECURE_CONNECTION
+            | CapabilityFlags::CLIENT_CONNECT_WITH_DB;
+        let mut handshake = capabilities.bits().to_le_bytes().to_vec();
+        handshake.extend_from_slice(&1024u32.to_le_bytes());
+        handshake.push(charset);
+        handshake.extend_from_slice(&[0; 23]);
+        handshake.extend_from_slice(user);
+        handshake.extend_from_slice(&[0, 0]);
+        handshake.extend_from_slice(database);
+        handshake.push(0);
+        handshake.extend_from_slice(b"mysql_native_password\0");
+        raw_auth_write_packet(&mut socket, 1, &handshake).await;
+        let (sequence, response) = raw_auth_read_packet(&mut socket).await;
+        assert_eq!(sequence, 2);
+        assert_eq!(response[0], 0);
+        let mut change = vec![0x11];
+        change.extend_from_slice(b"next_\xff");
+        change.extend_from_slice(&[0, 0]);
+        change.extend_from_slice(b"next_db_\xc3");
+        change.push(0);
+        change.extend_from_slice(&65_535u16.to_le_bytes());
+        change.extend_from_slice(b"mysql_native_password\0");
+        raw_auth_write_packet(&mut socket, 0, &change).await;
+        let (sequence, response) = raw_auth_read_packet(&mut socket).await;
+        assert_eq!(sequence, 1);
+        assert_eq!(response[0], 0);
+        raw_auth_write_packet(&mut socket, 0, &[0x0e]).await;
+        let (sequence, response) = raw_auth_read_packet(&mut socket).await;
+        assert_eq!(sequence, 1);
+        assert_eq!(response[0], 0);
+        raw_auth_write_packet(&mut socket, 0, &[0x01]).await;
+        server.await.unwrap();
+        assert_eq!(
+            *names.lock().unwrap(),
+            [
+                (user.to_vec(), u16::from(charset), true),
+                (b"next_\xff".to_vec(), 65_535, false),
+            ]
+        );
+        assert_eq!(
+            *databases.lock().unwrap(),
+            [database.to_vec(), b"next_db_\xc3".to_vec(),]
+        );
+    }
+}
 
 struct TestingShim<Q, P, E> {
     columns: Vec<Column>,
@@ -66,9 +164,11 @@ where
 
     async fn on_prepare<'a>(
         &'a mut self,
-        query: &'a str,
+        query: &'a [u8],
         info: StatementMetaWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
+        let query = std::str::from_utf8(query)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let id = (self.on_p)(query);
         info.reply(id, &self.params, &self.columns).await
     }
@@ -79,16 +179,18 @@ where
         params: ParamParser<'a>,
         results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
-        (self.on_e)(id, params.into_iter().collect(), results).await
+        (self.on_e)(id, params.parse()?, results).await
     }
 
     async fn on_close<'a>(&'a mut self, _stmt: u32) {}
 
     async fn on_query<'a>(
         &'a mut self,
-        query: &'a str,
+        query: &'a [u8],
         results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
+        let query = std::str::from_utf8(query)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if query.eq_ignore_ascii_case("SELECT @@socket")
             || query.eq_ignore_ascii_case("SELECT @@wait_timeout")
             || query.eq_ignore_ascii_case("SELECT @@max_allowed_packet")
@@ -98,25 +200,40 @@ where
         {
             let cols = [
                 Column {
-                    table: String::new(),
-                    column: "@@max_allowed_packet".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"@@max_allowed_packet".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
-                    table: String::new(),
-                    column: "@@wait_timeout".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"@@wait_timeout".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
-                    table: String::new(),
-                    column: "@@socket".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"@@socket".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 },
             ];
             let mut row_writer = results.start(&cols).await?;
@@ -132,7 +249,7 @@ where
 
     async fn on_init<'a>(
         &'a mut self,
-        _schema: &'a str,
+        _schema: &'a [u8],
         writer: InitWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
         writer.ok().await
@@ -246,15 +363,40 @@ async fn it_pings() {
 
 struct InitCountingShim {
     on_init_called: Arc<AtomicBool>,
+    databases: Arc<Mutex<Vec<Vec<u8>>>>,
+    names: Arc<Mutex<Vec<(Vec<u8>, u16, bool)>>>,
 }
 
 #[async_trait]
 impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for InitCountingShim {
     type Error = io::Error;
+    async fn auth_plugin_for_username(
+        &self,
+        username: &[u8],
+        charset: u16,
+        initial_handshake: bool,
+    ) -> &'static str {
+        self.names
+            .lock()
+            .unwrap()
+            .push((username.to_vec(), charset, initial_handshake));
+        "mysql_native_password"
+    }
+    async fn on_change_user(
+        &mut self,
+        _: &[u8],
+        database: Option<&[u8]>,
+        _: u16,
+    ) -> io::Result<Option<(ErrorKind, String)>> {
+        if let Some(database) = database {
+            self.databases.lock().unwrap().push(database.to_vec());
+        }
+        Ok(None)
+    }
 
     async fn on_prepare<'a>(
         &'a mut self,
-        _query: &'a str,
+        _query: &'a [u8],
         _info: StatementMetaWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
         Err(io::Error::new(
@@ -279,9 +421,11 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for InitCountingShim {
 
     async fn on_query<'a>(
         &'a mut self,
-        query: &'a str,
+        query: &'a [u8],
         results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
+        let query = std::str::from_utf8(query)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if query.eq_ignore_ascii_case("SELECT @@socket")
             || query.eq_ignore_ascii_case("SELECT @@wait_timeout")
             || query.eq_ignore_ascii_case("SELECT @@max_allowed_packet")
@@ -291,25 +435,40 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for InitCountingShim {
         {
             let columns = [
                 Column {
-                    table: String::new(),
-                    column: "@@max_allowed_packet".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"@@max_allowed_packet".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
-                    table: String::new(),
-                    column: "@@wait_timeout".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"@@wait_timeout".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                    decimals: None,
                 },
                 Column {
-                    table: String::new(),
-                    column: "@@socket".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"@@socket".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 },
             ];
             let mut row_writer = results.start(&columns).await?;
@@ -328,10 +487,11 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for InitCountingShim {
 
     async fn on_init<'a>(
         &'a mut self,
-        _schema: &'a str,
+        schema: &'a [u8],
         writer: InitWriter<'a, BufWriter<OwnedWriteHalf>>,
     ) -> Result<(), Self::Error> {
         self.on_init_called.store(true, Ordering::SeqCst);
+        self.databases.lock().unwrap().push(schema.to_vec());
         writer.ok().await
     }
 }
@@ -339,8 +499,11 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for InitCountingShim {
 #[tokio::test]
 async fn handshake_with_initial_database_relies_on_backend_ack() {
     let on_init_called = Arc::new(AtomicBool::new(false));
+    let databases = Arc::new(Mutex::new(Vec::new()));
     let shim = InitCountingShim {
         on_init_called: on_init_called.clone(),
+        databases: databases.clone(),
+        names: Arc::new(Mutex::new(Vec::new())),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -365,6 +528,150 @@ async fn handshake_with_initial_database_relies_on_backend_ack() {
         on_init_called.load(Ordering::SeqCst),
         "backend on_init was not invoked"
     );
+    assert_eq!(*databases.lock().unwrap(), [b"initial_db".to_vec()]);
+}
+
+struct LocalInfileShim {
+    data: Arc<Mutex<Vec<u8>>>,
+}
+
+#[async_trait]
+impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for LocalInfileShim {
+    type Error = io::Error;
+
+    fn server_capabilities(&self, base: CapabilityFlags) -> CapabilityFlags {
+        base | CapabilityFlags::CLIENT_LOCAL_FILES
+    }
+
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _query: &'a [u8],
+        _info: StatementMetaWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "prepare not supported in test shim",
+        ))
+    }
+
+    async fn on_execute<'a>(
+        &'a mut self,
+        _id: u32,
+        _params: ParamParser<'a>,
+        _results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "execute not supported in test shim",
+        ))
+    }
+
+    async fn on_close<'a>(&'a mut self, _stmt: u32) {}
+
+    async fn on_query<'a>(
+        &'a mut self,
+        query: &'a [u8],
+        results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        let query = std::str::from_utf8(query)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if query.eq_ignore_ascii_case("SELECT @@socket")
+            || query.eq_ignore_ascii_case("SELECT @@wait_timeout")
+            || query.eq_ignore_ascii_case("SELECT @@max_allowed_packet")
+            || query.eq_ignore_ascii_case("SELECT @@max_allowed_packet,@@wait_timeout,@@socket")
+        {
+            results.completed(OkResponse::default()).await
+        } else {
+            results
+                .error(ErrorKind::ER_PARSE_ERROR, b"unexpected query")
+                .await
+        }
+    }
+
+    async fn preflight_local_infile<'writer>(
+        &mut self,
+        query: &[u8],
+        client_supports_local: bool,
+        results: QueryResultWriter<'writer, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<opensrv_mysql::LocalInfilePreflight<'writer, BufWriter<OwnedWriteHalf>>, Self::Error>
+    {
+        let query = std::str::from_utf8(query)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if query
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("load data local infile")
+        {
+            assert!(client_supports_local);
+            self.data.lock().unwrap().clear();
+            Ok(opensrv_mysql::LocalInfilePreflight::Request {
+                filename: b"dummy".to_vec(),
+                results,
+            })
+        } else {
+            Ok(opensrv_mysql::LocalInfilePreflight::Continue(results))
+        }
+    }
+
+    async fn on_local_infile_data<'a>(&'a mut self, data: &'a [u8]) -> Result<(), Self::Error> {
+        self.data.lock().unwrap().extend_from_slice(data);
+        Ok(())
+    }
+
+    async fn on_local_infile_end<'a>(
+        &'a mut self,
+        results: QueryResultWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        results
+            .completed(OkResponse {
+                affected_rows: 2,
+                ..OkResponse::default()
+            })
+            .await
+    }
+
+    async fn on_init<'a>(
+        &'a mut self,
+        _schema: &'a [u8],
+        writer: InitWriter<'a, BufWriter<OwnedWriteHalf>>,
+    ) -> Result<(), Self::Error> {
+        writer.ok().await
+    }
+}
+
+#[tokio::test]
+async fn load_data_local_infile_streams_client_data_and_returns_ok() {
+    let data = Arc::new(Mutex::new(Vec::new()));
+    let shim = LocalInfileShim { data: data.clone() };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let (r, w) = socket.into_split();
+        let w = BufWriter::with_capacity(100 * 1024, w);
+        AsyncMysqlIntermediary::run_on(shim, r, w).await.unwrap();
+    });
+
+    let opts = Opts::from_url(&format!("mysql://127.0.0.1:{port}")).unwrap();
+    let mut conn = mysql_async::Conn::new(opts).await.unwrap();
+    conn.set_infile_handler(async move {
+        Ok(futures::stream::iter([
+            bytes::Bytes::from_static(b"1,a\n"),
+            bytes::Bytes::from_static(b"2,b\n"),
+        ])
+        .map(Ok)
+        .boxed())
+    });
+    conn.query_drop("LOAD DATA LOCAL INFILE 'dummy' INTO TABLE t")
+        .await
+        .unwrap();
+    conn.disconnect().await.unwrap();
+    server.await.unwrap();
+
+    assert_eq!(&*data.lock().unwrap(), b"1,a\n2,b\n");
 }
 
 #[tokio::test]
@@ -388,11 +695,16 @@ async fn no_rows() {
         move |_, w| {
             async move {
                 let cols = [Column {
-                    table: String::new(),
-                    column: "a".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"a".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 w.start(&cols[..]).await?.finish().await
             }
@@ -515,11 +827,16 @@ async fn empty_on_drop() {
         move |_, w| {
             async move {
                 let cols = [Column {
-                    table: String::new(),
-                    column: "a".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"a".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let row_writer = w.start(&cols[..]).await?;
                 row_writer.finish().await
@@ -543,11 +860,16 @@ async fn it_queries_nulls() {
         |_, w| {
             async move {
                 let cols = &[Column {
-                    table: String::new(),
-                    column: "a".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"a".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let mut w = w.start(cols).await?;
                 w.write_col(None::<i16>)?;
@@ -574,11 +896,16 @@ async fn it_queries() {
         |_, w| {
             async move {
                 let cols = &[Column {
-                    table: String::new(),
-                    column: "a".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"a".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let mut w = w.start(cols).await?;
                 w.write_col(1024i16)?;
@@ -606,18 +933,28 @@ async fn it_queries_many_rows() {
             async move {
                 let cols = &[
                     Column {
-                        table: String::new(),
-                        column: "a".to_owned(),
+                        database: Vec::new(),
+                        org_table: Vec::new(),
+                        org_column: Vec::new(),
+                        table: Vec::new(),
+                        column: b"a".to_vec(),
                         collen: 0,
+                        charset: None,
                         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                         colflags: myc::constants::ColumnFlags::empty(),
+                        decimals: None,
                     },
                     Column {
-                        table: String::new(),
-                        column: "b".to_owned(),
+                        database: Vec::new(),
+                        org_table: Vec::new(),
+                        org_column: Vec::new(),
+                        table: Vec::new(),
+                        column: b"b".to_vec(),
                         collen: 0,
+                        charset: None,
                         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                         colflags: myc::constants::ColumnFlags::empty(),
+                        decimals: None,
                     },
                 ];
                 let mut w = w.start(cols).await?;
@@ -649,19 +986,29 @@ async fn it_queries_many_rows() {
 #[tokio::test]
 async fn it_prepares() {
     let cols = vec![Column {
-        table: String::new(),
-        column: "a".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"a".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
-        table: String::new(),
-        column: "c".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"c".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
 
     TestingShim::new(
@@ -707,53 +1054,88 @@ async fn it_prepares() {
 async fn insert_exec() {
     let params = vec![
         Column {
-            table: String::new(),
-            column: "username".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"username".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "email".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"email".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "pw".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"pw".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "created".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"created".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_DATETIME,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "session".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"session".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "rss".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"rss".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "mail".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"mail".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
 
@@ -854,19 +1236,29 @@ async fn insert_exec() {
 #[tokio::test]
 async fn send_long() {
     let cols = vec![Column {
-        table: String::new(),
-        column: "a".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"a".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
-        table: String::new(),
-        column: "c".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"c".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_BLOB,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
 
     TestingShim::new(
@@ -912,18 +1304,28 @@ async fn send_long() {
 async fn it_prepares_many() {
     let cols = vec![
         Column {
-            table: String::new(),
-            column: "a".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"a".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "b".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"b".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
     let cols2 = cols.clone();
@@ -970,19 +1372,29 @@ async fn it_prepares_many() {
 #[tokio::test]
 async fn prepared_empty() {
     let cols = vec![Column {
-        table: String::new(),
-        column: "a".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"a".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
-        table: String::new(),
-        column: "c".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"c".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
 
     TestingShim::new(
@@ -1010,11 +1422,16 @@ async fn prepared_empty() {
 #[tokio::test]
 async fn prepared_no_params() {
     let cols = vec![Column {
-        table: String::new(),
-        column: "a".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"a".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     let params = vec![];
@@ -1050,35 +1467,55 @@ async fn prepared_no_params() {
 async fn prepared_nulls() {
     let cols = vec![
         Column {
-            table: String::new(),
-            column: "a".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"a".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "b".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"b".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
     let cols2 = cols.clone();
     let params = vec![
         Column {
-            table: String::new(),
-            column: "c".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"c".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
         Column {
-            table: String::new(),
-            column: "d".to_owned(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"d".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             colflags: myc::constants::ColumnFlags::empty(),
+            decimals: None,
         },
     ];
 
@@ -1126,11 +1563,16 @@ async fn prepared_nulls() {
 #[tokio::test]
 async fn prepared_no_rows() {
     let cols = vec![Column {
-        table: String::new(),
-        column: "a".to_owned(),
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: b"a".to_vec(),
         collen: 0,
+        charset: None,
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
+        decimals: None,
     }];
     let cols2 = cols.clone();
     TestingShim::new(
@@ -1196,11 +1638,16 @@ async fn large_packet() {
         move |_, w| {
             async move {
                 let cols = vec![Column {
-                    table: String::new(),
-                    column: "a".to_owned(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: b"a".to_vec(),
                     collen: 0,
+                    charset: None,
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_BLOB,
                     colflags: myc::constants::ColumnFlags::empty(),
+                    decimals: None,
                 }];
                 let mut row_writer = w.start(&cols).await?;
                 let blob_col = vec![0; U24_MAX + 1];
@@ -1243,25 +1690,40 @@ async fn ok_packet_with_info_when_session_track_disabled() {
                     "SELECT @@max_allowed_packet,@@wait_timeout,@@socket" => {
                         let cols = &[
                             Column {
-                                table: String::new(),
-                                column: "@@max_allowed_packet".to_owned(),
+                                database: Vec::new(),
+                                org_table: Vec::new(),
+                                org_column: Vec::new(),
+                                table: Vec::new(),
+                                column: b"@@max_allowed_packet".to_vec(),
                                 collen: 0,
+                                charset: None,
                                 coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                 colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                                decimals: None,
                             },
                             Column {
-                                table: String::new(),
-                                column: "@@wait_timeout".to_owned(),
+                                database: Vec::new(),
+                                org_table: Vec::new(),
+                                org_column: Vec::new(),
+                                table: Vec::new(),
+                                column: b"@@wait_timeout".to_vec(),
                                 collen: 0,
+                                charset: None,
                                 coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                 colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                                decimals: None,
                             },
                             Column {
-                                table: String::new(),
-                                column: "@@socket".to_owned(),
+                                database: Vec::new(),
+                                org_table: Vec::new(),
+                                org_column: Vec::new(),
+                                table: Vec::new(),
+                                column: b"@@socket".to_vec(),
                                 collen: 0,
+                                charset: None,
                                 coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                                 colflags: myc::constants::ColumnFlags::empty(),
+                                decimals: None,
                             },
                         ];
 
@@ -1274,11 +1736,16 @@ async fn ok_packet_with_info_when_session_track_disabled() {
                     }
                     "SELECT @@version_comment" => {
                         let cols = &[Column {
-                            table: String::new(),
-                            column: "@@version_comment".to_owned(),
+                            database: Vec::new(),
+                            org_table: Vec::new(),
+                            org_column: Vec::new(),
+                            table: Vec::new(),
+                            column: b"@@version_comment".to_vec(),
                             collen: 0,
+                            charset: None,
                             coltype: myc::constants::ColumnType::MYSQL_TYPE_VAR_STRING,
                             colflags: myc::constants::ColumnFlags::empty(),
+                            decimals: None,
                         }];
 
                         let mut row_writer = w.start(cols).await?;

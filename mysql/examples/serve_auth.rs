@@ -35,7 +35,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
     async fn on_prepare<'a>(
         &'a mut self,
-        _: &'a str,
+        _: &'a [u8],
         info: StatementMetaWriter<'a, W>,
     ) -> io::Result<()> {
         info.reply(42, &[], &[]).await
@@ -55,17 +55,22 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
     async fn on_query<'a>(
         &'a mut self,
-        sql: &'a str,
+        sql: &'a [u8],
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
         println!("execute sql {sql:?}");
 
         let cols = &[Column {
-            table: String::new(),
-            column: "abc".to_string(),
+            database: Vec::new(),
+            org_table: Vec::new(),
+            org_column: Vec::new(),
+            table: Vec::new(),
+            column: b"abc".to_vec(),
             collen: 0,
+            charset: None,
             coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
             colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+            decimals: None,
         }];
 
         let mut w = results.start(cols).await?;
@@ -80,6 +85,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         &self,
         _auth_plugin: &str,
         username: &[u8],
+        _character_set: u16,
+        _initial_handshake: bool,
         _salt: &[u8],
         _auth_data: &[u8],
     ) -> bool {
@@ -99,7 +106,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         "mysql_native_password"
     }
 
-    async fn auth_plugin_for_username(&self, _user: &[u8]) -> &'static str {
+    async fn auth_plugin_for_username(
+        &self,
+        _user: &[u8],
+        _character_set: u16,
+        _initial_handshake: bool,
+    ) -> &'static str {
         "mysql_native_password"
     }
 

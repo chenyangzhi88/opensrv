@@ -103,11 +103,16 @@ mod roundtrip_bin {
             fn $name() {
                 let mut data = Vec::new();
                 let mut col = Column {
-                    table: String::new(),
-                    column: String::new(),
+                    database: Vec::new(),
+                    org_table: Vec::new(),
+                    org_column: Vec::new(),
+                    table: Vec::new(),
+                    column: Vec::new(),
                     collen: 0,
+                    charset: None,
                     coltype: $ct,
                     colflags: ColumnFlags::empty(),
+                    decimals: None,
                 };
 
                 if !$sig {
@@ -255,4 +260,210 @@ mod roundtrip_bin {
         "foobar".to_owned(),
         ColumnType::MYSQL_TYPE_STRING
     );
+}
+
+#[test]
+fn mysql_text_temporals_use_binary_protocol_encoding() {
+    let column = |coltype| Column {
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: Vec::new(),
+        collen: 0,
+        charset: None,
+        coltype,
+        colflags: ColumnFlags::empty(),
+        decimals: None,
+    };
+
+    let mut date = Vec::new();
+    crate::MySqlTextValue(b"2002-01-02")
+        .to_mysql_bin(&mut date, &column(ColumnType::MYSQL_TYPE_DATE))
+        .unwrap();
+    assert_eq!(date, vec![4, 0xd2, 0x07, 1, 2]);
+
+    let mut zero_datetime = Vec::new();
+    crate::MySqlTextValue(b"0000-00-00 00:00:00")
+        .to_mysql_bin(&mut zero_datetime, &column(ColumnType::MYSQL_TYPE_DATETIME))
+        .unwrap();
+    assert_eq!(zero_datetime, vec![0]);
+
+    let mut time = Vec::new();
+    crate::MySqlTextValue(b"12:49:00")
+        .to_mysql_bin(&mut time, &column(ColumnType::MYSQL_TYPE_TIME))
+        .unwrap();
+    assert_eq!(time, vec![8, 0, 0, 0, 0, 0, 12, 49, 0]);
+}
+
+#[test]
+fn mysql_text_value_preserves_non_utf8_character_bytes() {
+    let column = Column {
+        database: Vec::new(),
+        org_table: Vec::new(),
+        org_column: Vec::new(),
+        table: Vec::new(),
+        column: Vec::new(),
+        collen: 0,
+        charset: None,
+        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+        colflags: ColumnFlags::empty(),
+        decimals: None,
+    };
+    let bytes = [0xee, 0xd5, 0x2c, 0x20];
+    let mut encoded = Vec::new();
+    crate::MySqlTextValue(&bytes)
+        .to_mysql_bin(&mut encoded, &column)
+        .unwrap();
+    assert_eq!(encoded, vec![4, 0xee, 0xd5, 0x2c, 0x20]);
+}
+
+#[test]
+fn stage2_temporal_codec_rejects_invalid_ranges_without_truncation() {
+    for (coltype, values) in [
+        (
+            ColumnType::MYSQL_TYPE_TIME,
+            vec!["2400:00:00", "12:00:00.1234567", "12:00:00.", "12:60:00"],
+        ),
+        (
+            ColumnType::MYSQL_TYPE_DATE,
+            vec!["10000-01-01", "2024-13-01", "2024-01-100"],
+        ),
+        (
+            ColumnType::MYSQL_TYPE_DATETIME,
+            vec![
+                "2024-01-01 24:00:00",
+                "2024-01-01 -01:00:00",
+                "2024-01-100 00:00:00",
+            ],
+        ),
+    ] {
+        let column = Column {
+            database: vec![],
+            table: vec![],
+            org_table: vec![],
+            column: vec![],
+            org_column: vec![],
+            collen: 0,
+            charset: Some(63),
+            coltype,
+            colflags: ColumnFlags::empty(),
+            decimals: Some(6),
+        };
+        for value in values {
+            assert!(
+                crate::MySqlTextValue(value.as_bytes())
+                    .to_mysql_bin(&mut Vec::new(), &column)
+                    .is_err(),
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_temporal_item_components_keep_binary_output_lengths_and_invalid_days() {
+    // Fixed 8.0.46 Protocol_binary::{store_date,store_datetime}: calendar
+    // components are output facts, not a second Gregorian Field-store check.
+    let column = |coltype| Column {
+        database: vec![],
+        org_table: vec![],
+        table: vec![],
+        org_column: vec![],
+        column: vec![],
+        collen: 0,
+        charset: Some(63),
+        coltype,
+        colflags: ColumnFlags::empty(),
+        decimals: Some(6),
+    };
+    for (text, coltype, expected) in [
+        ("0000-00-00", ColumnType::MYSQL_TYPE_DATE, vec![0]),
+        (
+            "2024-01-32",
+            ColumnType::MYSQL_TYPE_DATE,
+            vec![4, 0xe8, 0x07, 1, 32],
+        ),
+        (
+            "9999-12-99",
+            ColumnType::MYSQL_TYPE_DATE,
+            vec![4, 0x0f, 0x27, 12, 99],
+        ),
+        (
+            "0000-00-00 00:00:00",
+            ColumnType::MYSQL_TYPE_DATETIME,
+            vec![0],
+        ),
+        (
+            "2024-01-32 00:00:00",
+            ColumnType::MYSQL_TYPE_DATETIME,
+            vec![4, 0xe8, 0x07, 1, 32],
+        ),
+        (
+            "2024-01-32 00:00:01",
+            ColumnType::MYSQL_TYPE_DATETIME,
+            vec![7, 0xe8, 0x07, 1, 32, 0, 0, 1],
+        ),
+        (
+            "9999-12-99 23:59:59.999999",
+            ColumnType::MYSQL_TYPE_DATETIME,
+            vec![11, 0x0f, 0x27, 12, 99, 23, 59, 59, 0x3f, 0x42, 0x0f, 0],
+        ),
+        (
+            "2024-01-32 00:00:00.000001",
+            ColumnType::MYSQL_TYPE_TIMESTAMP,
+            vec![11, 0xe8, 0x07, 1, 32, 0, 0, 0, 1, 0, 0, 0],
+        ),
+    ] {
+        let mut encoded = vec![];
+        crate::MySqlTextValue(text.as_bytes())
+            .to_mysql_bin(&mut encoded, &column(coltype))
+            .unwrap();
+        assert_eq!(encoded, expected, "{text}");
+    }
+}
+
+#[test]
+fn native_time_item_day_hours_are_not_clamped_by_the_output_codec() {
+    let column = Column {
+        database: vec![],
+        org_table: vec![],
+        table: vec![],
+        org_column: vec![],
+        column: vec![],
+        collen: 17,
+        charset: Some(63),
+        coltype: ColumnType::MYSQL_TYPE_TIME,
+        colflags: ColumnFlags::empty(),
+        decimals: Some(6),
+    };
+    for (hours, days, hour) in [(838, 34, 22), (839, 34, 23), (2399, 99, 23)] {
+        for (negative, fraction) in [(false, ""), (true, ".123456")] {
+            let text = format!("{}{hours}:59:59{fraction}", if negative { "-" } else { "" });
+            let mut actual = vec![];
+            crate::MySqlTextValue(text.as_bytes())
+                .to_mysql_bin(&mut actual, &column)
+                .unwrap();
+            let mut expected = vec![if fraction.is_empty() { 8 } else { 12 }, u8::from(negative)];
+            expected.extend((days as u32).to_le_bytes());
+            expected.extend([hour, 59, 59]);
+            if !fraction.is_empty() {
+                expected.extend(123456_u32.to_le_bytes());
+            }
+            assert_eq!(actual, expected, "{text}");
+            let mut text_bytes = vec![];
+            crate::MySqlTextValue(text.as_bytes())
+                .to_mysql_text(&mut text_bytes)
+                .unwrap();
+            assert_eq!(&text_bytes[1..], text.as_bytes());
+        }
+    }
+    for text in ["2400:00:00", "-2400:00:00", "2399:60:00", "2399:00:60"] {
+        assert!(
+            crate::MySqlTextValue(text.as_bytes())
+                .to_mysql_bin(&mut vec![], &column)
+                .is_err(),
+            "{text}"
+        );
+    }
 }

@@ -23,8 +23,12 @@ use tokio::io::AsyncWrite;
 
 const BIN_GENERAL_CI: u16 = 0x3f;
 
-fn column_charset(column: &Column) -> u16 {
+pub(crate) fn column_charset(column: &Column) -> u16 {
     use crate::myc::constants::UTF8_GENERAL_CI;
+
+    if let Some(charset) = column.charset {
+        return charset;
+    }
 
     if column
         .colflags
@@ -59,8 +63,10 @@ fn column_charset(column: &Column) -> u16 {
 pub(crate) async fn write_eof_packet<W: AsyncWrite + Unpin>(
     w: &mut PacketWriter<W>,
     s: StatusFlags,
+    warnings: u16,
 ) -> io::Result<()> {
-    w.write_all(&[0xFE, 0x00, 0x00])?;
+    w.write_all(&[0xFE])?;
+    w.write_u16::<LittleEndian>(warnings)?;
     w.write_u16::<LittleEndian>(s.bits())?;
     w.end_packet().await
 }
@@ -80,18 +86,13 @@ pub(crate) async fn write_ok_packet<W: AsyncWrite + Unpin>(
         w.write_u16::<LittleEndian>(ok_packet.status_flags.bits())?;
     }
 
-    // Only session-tracking clients expect length-encoded info per protocol; otherwise emit raw text.
+    // MySQL emits OK info as a length-encoded string. Current MySQL clients
+    // parse this form even without CLIENT_SESSION_TRACK (matching
+    // net_send_ok), and result-set terminators use the same encoding.
     let has_session_track = client_capabilities.contains(CapabilityFlags::CLIENT_SESSION_TRACK);
-    let expect_lenenc_info = has_session_track
-        || ok_packet.header == 0xfe
-        || client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF);
     let send_info = !ok_packet.info.is_empty() || has_session_track;
     if send_info {
-        if expect_lenenc_info {
-            w.write_lenenc_str(ok_packet.info.as_bytes())?;
-        } else {
-            w.write_all(ok_packet.info.as_bytes())?;
-        }
+        w.write_lenenc_str(ok_packet.info.as_bytes())?;
     }
 
     // Session state info is optional and only sent if flag is set
@@ -100,7 +101,7 @@ pub(crate) async fn write_ok_packet<W: AsyncWrite + Unpin>(
             .status_flags
             .contains(StatusFlags::SERVER_SESSION_STATE_CHANGED)
     {
-        w.write_lenenc_str(ok_packet.session_state_info.as_bytes())?;
+        w.write_lenenc_str(&ok_packet.session_state_info)?;
     }
     w.end_packet().await
 }
@@ -110,10 +111,19 @@ pub async fn write_err<W: AsyncWrite + Unpin>(
     msg: &[u8],
     w: &mut PacketWriter<W>,
 ) -> io::Result<()> {
+    write_err_raw(err as u16, err.sqlstate(), msg, w).await
+}
+
+pub async fn write_err_raw<W: AsyncWrite + Unpin>(
+    code: u16,
+    sqlstate: &[u8; 5],
+    msg: &[u8],
+    w: &mut PacketWriter<W>,
+) -> io::Result<()> {
     w.write_u8(0xFF)?;
-    w.write_u16::<LittleEndian>(err as u16)?;
+    w.write_u16::<LittleEndian>(code)?;
     w.write_u8(b'#')?;
-    w.write_all(err.sqlstate())?;
+    w.write_all(sqlstate)?;
     w.write_all(msg)?;
     w.end_packet().await
 }
@@ -122,8 +132,10 @@ pub(crate) async fn write_prepare_ok<'a, PI, CI, W>(
     id: u32,
     params: PI,
     columns: CI,
+    warnings: u16,
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
+    send_metadata: bool,
 ) -> io::Result<()>
 where
     PI: IntoIterator<Item = &'a Column>,
@@ -141,13 +153,16 @@ where
     w.write_u16::<LittleEndian>(ci.len() as u16)?;
     w.write_u16::<LittleEndian>(pi.len() as u16)?;
     w.write_u8(0x00)?;
-    w.write_u16::<LittleEndian>(0)?; // number of warnings
+    w.write_u16::<LittleEndian>(warnings)?;
+    if client_capabilities.contains(CapabilityFlags::CLIENT_OPTIONAL_RESULTSET_METADATA) {
+        w.write_u8(u8::from(send_metadata))?;
+    }
     w.end_packet().await?;
 
-    if pi.len() > 0 {
+    if send_metadata && pi.len() > 0 {
         write_column_definitions_41(pi, w, client_capabilities, false).await?;
     }
-    if ci.len() > 0 {
+    if send_metadata && ci.len() > 0 {
         write_column_definitions_41(ci, w, client_capabilities, false).await?;
     }
     Ok(())
@@ -165,30 +180,93 @@ where
     I: IntoIterator<Item = &'a Column>,
     W: AsyncWrite + Unpin,
 {
-    for c in i {
+    write_column_definitions_41_with_defaults(i, w, client_capabilities, is_com_field_list, None)
+        .await
+}
+
+pub(crate) async fn write_column_definitions_41_with_defaults<'a, I, W>(
+    i: I,
+    w: &mut PacketWriter<W>,
+    client_capabilities: CapabilityFlags,
+    is_com_field_list: bool,
+    field_defaults: Option<&[Option<Vec<u8>>]>,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = &'a Column>,
+    W: AsyncWrite + Unpin,
+{
+    write_column_definitions_41_with_defaults_and_status(
+        i,
+        w,
+        client_capabilities,
+        is_com_field_list,
+        field_defaults,
+        StatusFlags::empty(),
+        0,
+    )
+    .await
+}
+
+pub(crate) async fn write_column_definitions_41_with_defaults_and_status<'a, I, W>(
+    i: I,
+    w: &mut PacketWriter<W>,
+    client_capabilities: CapabilityFlags,
+    is_com_field_list: bool,
+    field_defaults: Option<&[Option<Vec<u8>>]>,
+    status: StatusFlags,
+    warnings: u16,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = &'a Column>,
+    W: AsyncWrite + Unpin,
+{
+    for (column_index, c) in i.into_iter().enumerate() {
         w.write_lenenc_str(b"def")?;
-        w.write_lenenc_str(b"")?;
-        w.write_lenenc_str(c.table.as_bytes())?;
-        w.write_lenenc_str(b"")?;
-        w.write_lenenc_str(c.column.as_bytes())?;
-        w.write_lenenc_str(b"")?;
+        w.write_lenenc_str(&c.database)?;
+        w.write_lenenc_str(&c.table)?;
+        w.write_lenenc_str(&c.org_table)?;
+        w.write_lenenc_str(&c.column)?;
+        w.write_lenenc_str(&c.org_column)?;
         w.write_lenenc_int(0xC)?;
         w.write_u16::<LittleEndian>(column_charset(c))?;
-        let column_length = if c.collen == 0 { 1024 } else { c.collen };
-        w.write_u32::<LittleEndian>(column_length)?;
+        w.write_u32::<LittleEndian>(c.collen)?;
         w.write_u8(c.coltype as u8)?;
         w.write_u16::<LittleEndian>(c.colflags.bits())?;
-        w.write_all(&[0x00])?; // decimals
+        w.write_all(&[c.decimals.unwrap_or(0)])?; // decimals
         w.write_all(&[0x00, 0x00])?; // unused
 
         if is_com_field_list {
-            w.write_all(&[0xfb])?;
+            if let Some(default) = field_defaults
+                .and_then(|defaults| defaults.get(column_index))
+                .and_then(Option::as_ref)
+            {
+                w.write_lenenc_str(default)?;
+            } else {
+                w.write_all(&[0xfb])?;
+            }
         }
         w.end_packet().await?;
     }
 
-    if !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-        write_eof_packet(w, StatusFlags::empty()).await
+    // COM_FIELD_LIST is a legacy stream with no column-count packet, so a
+    // terminator is always required. With CLIENT_DEPRECATE_EOF, libmysql
+    // parses that terminator as an OK packet whose header is 0xFE.
+    if is_com_field_list && client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+        write_ok_packet(
+            w,
+            client_capabilities,
+            OkResponse {
+                header: 0xfe,
+                status_flags: status,
+                warnings,
+                ..OkResponse::default()
+            },
+        )
+        .await
+    } else if is_com_field_list
+        || !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+    {
+        write_eof_packet(w, status, warnings).await
     } else {
         Ok(())
     }
@@ -204,250 +282,29 @@ where
     <I as IntoIterator>::IntoIter: ExactSizeIterator,
     W: AsyncWrite + Unpin,
 {
-    let i = i.into_iter();
-    w.write_lenenc_int(i.len() as u64)?;
-    w.end_packet().await?;
-    write_column_definitions_41(i, w, client_capabilities, false).await
+    column_definitions_with_metadata(i, w, client_capabilities, true).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Column, ColumnFlags, ColumnType};
-    use mysql_common::constants::CapabilityFlags;
-    use mysql_common::io::ParseBuf;
-    use mysql_common::packets::{OkPacket, OkPacketDeserializer, ResultSetTerminator};
-    use tokio::io::AsyncReadExt;
-
-    fn parse_lenenc_int(buf: &[u8]) -> (u64, usize) {
-        match buf[0] {
-            v @ 0x00..=0xfa => (v as u64, 1),
-            0xfc => {
-                let len = u16::from_le_bytes([buf[1], buf[2]]);
-                (len as u64, 3)
-            }
-            0xfd => {
-                let len = (buf[1] as u32) | ((buf[2] as u32) << 8) | ((buf[3] as u32) << 16);
-                (len as u64, 4)
-            }
-            0xfe => {
-                let len = u64::from_le_bytes([
-                    buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
-                ]);
-                (len, 9)
-            }
-            marker => panic!("unexpected length-encoded integer marker: {marker:#x}"),
-        }
+pub(crate) async fn column_definitions_with_metadata<'a, I, W>(
+    i: I,
+    w: &mut PacketWriter<W>,
+    client_capabilities: CapabilityFlags,
+    send_metadata: bool,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = &'a Column>,
+    <I as IntoIterator>::IntoIter: ExactSizeIterator,
+    W: AsyncWrite + Unpin,
+{
+    let i = i.into_iter();
+    w.write_lenenc_int(i.len() as u64)?;
+    if client_capabilities.contains(CapabilityFlags::CLIENT_OPTIONAL_RESULTSET_METADATA) {
+        w.write_u8(u8::from(send_metadata))?;
     }
-
-    async fn extract_payload_with_header(
-        info: &str,
-        capabilities: CapabilityFlags,
-        header: u8,
-    ) -> Vec<u8> {
-        let (mut client, server) = tokio::io::duplex(1024);
-        let mut writer = PacketWriter::new(server);
-
-        let ok_packet = OkResponse {
-            header,
-            info: info.to_string(),
-            ..Default::default()
-        };
-
-        write_ok_packet(&mut writer, capabilities, ok_packet)
-            .await
-            .expect("write_ok_packet succeeds");
-
-        let mut header = [0u8; 4];
-        client
-            .read_exact(&mut header)
-            .await
-            .expect("payload header available");
-        let payload_len =
-            (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
-        let mut payload = vec![0u8; payload_len];
-        client
-            .read_exact(&mut payload)
-            .await
-            .expect("payload body available");
-        payload
-    }
-
-    async fn extract_payload(info: &str, capabilities: CapabilityFlags) -> Vec<u8> {
-        extract_payload_with_header(info, capabilities, 0x00).await
-    }
-
-    fn consume_ok_packet_prefix(payload: &[u8]) -> (usize, u16, u16) {
-        let mut idx = 0;
-        assert_eq!(payload[idx], 0x00);
-        idx += 1;
-
-        let (affected_rows, consumed) = parse_lenenc_int(&payload[idx..]);
-        assert_eq!(affected_rows, 0);
-        idx += consumed;
-
-        let (last_insert_id, consumed) = parse_lenenc_int(&payload[idx..]);
-        assert_eq!(last_insert_id, 0);
-        idx += consumed;
-
-        let status = u16::from_le_bytes([payload[idx], payload[idx + 1]]);
-        idx += 2;
-
-        let warnings = u16::from_le_bytes([payload[idx], payload[idx + 1]]);
-        idx += 2;
-
-        (idx, status, warnings)
-    }
-
-    #[test]
-    fn column_charset_defaults_to_utf8() {
-        use crate::myc::constants::UTF8_GENERAL_CI;
-
-        let column = Column {
-            table: "t".into(),
-            column: "c".into(),
-            collen: 0,
-            coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-            colflags: ColumnFlags::empty(),
-        };
-
-        assert_eq!(column_charset(&column), UTF8_GENERAL_CI);
-    }
-
-    #[test]
-    fn column_charset_uses_binary_for_numeric_types() {
-        let column = Column {
-            table: "t".into(),
-            column: "c".into(),
-            collen: 0,
-            coltype: ColumnType::MYSQL_TYPE_LONG,
-            colflags: ColumnFlags::empty(),
-        };
-
-        assert_eq!(column_charset(&column), BIN_GENERAL_CI);
-    }
-
-    #[test]
-    fn column_charset_uses_binary_when_flagged() {
-        let column = Column {
-            table: "t".into(),
-            column: "c".into(),
-            collen: 0,
-            coltype: ColumnType::MYSQL_TYPE_STRING,
-            colflags: ColumnFlags::BINARY_FLAG,
-        };
-
-        assert_eq!(column_charset(&column), BIN_GENERAL_CI);
-    }
-
-    #[test]
-    fn column_charset_handles_blob_types() {
-        let column = Column {
-            table: "t".into(),
-            column: "c".into(),
-            collen: 0,
-            coltype: ColumnType::MYSQL_TYPE_BLOB,
-            colflags: ColumnFlags::empty(),
-        };
-
-        assert_eq!(column_charset(&column), BIN_GENERAL_CI);
-    }
-
-    #[test]
-    fn column_charset_respects_blob_flag() {
-        let column = Column {
-            table: "t".into(),
-            column: "c".into(),
-            collen: 0,
-            coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
-            colflags: ColumnFlags::BLOB_FLAG,
-        };
-
-        assert_eq!(column_charset(&column), BIN_GENERAL_CI);
-    }
-
-    #[tokio::test]
-    async fn ok_packet_info_is_length_encoded_with_session_track() {
-        let info = "Read 1 rows, 1.00 B in 0.007 sec.";
-        let capabilities =
-            CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_SESSION_TRACK;
-        let payload = extract_payload(info, capabilities).await;
-
-        let (mut idx, status, warnings) = consume_ok_packet_prefix(&payload);
-        assert_eq!(status, 0);
-        assert_eq!(warnings, 0);
-
-        let (info_len, consumed) = parse_lenenc_int(&payload[idx..]);
-        assert_eq!(info_len as usize, info.len());
-        assert_eq!(payload[idx], info.len() as u8);
-        idx += consumed;
-
-        let encoded = &payload[idx..idx + info.len()];
-        assert_eq!(encoded, info.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn ok_packet_info_uses_extended_length_prefix_when_needed() {
-        let info = "x".repeat(300);
-        let capabilities =
-            CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_SESSION_TRACK;
-        let payload = extract_payload(&info, capabilities).await;
-
-        let (mut idx, status, warnings) = consume_ok_packet_prefix(&payload);
-        assert_eq!(status, 0);
-        assert_eq!(warnings, 0);
-
-        let (info_len, consumed) = parse_lenenc_int(&payload[idx..]);
-        assert_eq!(consumed, 3, "expected 0xFC marker with two-byte length");
-        assert_eq!(payload[idx], 0xFC);
-        assert_eq!(info_len as usize, info.len());
-        idx += consumed;
-
-        let encoded = &payload[idx..idx + info.len()];
-        assert_eq!(encoded, info.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn ok_packet_skips_info_for_empty_string_without_session_track() {
-        let payload = extract_payload("", CapabilityFlags::CLIENT_PROTOCOL_41).await;
-
-        let (idx, status, warnings) = consume_ok_packet_prefix(&payload);
-        assert_eq!(status, 0);
-        assert_eq!(warnings, 0);
-        assert_eq!(
-            idx,
-            payload.len(),
-            "empty info without CLIENT_SESSION_TRACK should not emit length prefix"
-        );
-    }
-
-    #[tokio::test]
-    async fn ok_packet_info_is_plain_string_without_session_track() {
-        let info = "Read 1 rows, 1.00 B in 0.007 sec.";
-        let payload = extract_payload(info, CapabilityFlags::CLIENT_PROTOCOL_41).await;
-
-        let (idx, status, warnings) = consume_ok_packet_prefix(&payload);
-        assert_eq!(status, 0);
-        assert_eq!(warnings, 0);
-
-        let encoded = &payload[idx..];
-        assert_eq!(encoded, info.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn ok_packet_with_deprecate_eof_parses_lenenc_info() {
-        let info = "x".repeat(300);
-        let capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
-            | CapabilityFlags::CLIENT_DEPRECATE_EOF
-            | CapabilityFlags::CLIENT_SESSION_TRACK;
-        let payload = extract_payload_with_header(&info, capabilities, 0xfe).await;
-
-        let mut buf = ParseBuf(&payload);
-        let ok_packet: OkPacket = buf
-            .parse::<OkPacketDeserializer<ResultSetTerminator>>(capabilities)
-            .expect("ResultSetTerminator packet to parse")
-            .into_inner();
-        assert_eq!(ok_packet.info_ref(), Some(info.as_bytes()));
-        assert_eq!(ok_packet.status_flags(), StatusFlags::empty());
+    w.end_packet().await?;
+    if send_metadata {
+        write_column_definitions_41(i, w, client_capabilities, false).await
+    } else {
+        Ok(())
     }
 }

@@ -35,6 +35,232 @@ pub trait ToMysqlValue {
     }
 }
 
+/// A value produced by a text-oriented execution engine that must be encoded according to the
+/// MySQL column descriptor when a binary-protocol resultset is requested.
+pub struct MySqlTextValue<'a>(pub &'a [u8]);
+
+impl ToMysqlValue for MySqlTextValue<'_> {
+    fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        self.0.to_mysql_text(w)
+    }
+
+    fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        if !matches!(
+            c.coltype,
+            ColumnType::MYSQL_TYPE_TINY
+                | ColumnType::MYSQL_TYPE_SHORT
+                | ColumnType::MYSQL_TYPE_YEAR
+                | ColumnType::MYSQL_TYPE_LONG
+                | ColumnType::MYSQL_TYPE_INT24
+                | ColumnType::MYSQL_TYPE_LONGLONG
+                | ColumnType::MYSQL_TYPE_FLOAT
+                | ColumnType::MYSQL_TYPE_DOUBLE
+                | ColumnType::MYSQL_TYPE_DATE
+                | ColumnType::MYSQL_TYPE_DATETIME
+                | ColumnType::MYSQL_TYPE_TIMESTAMP
+                | ColumnType::MYSQL_TYPE_TIME
+        ) {
+            // Character and binary result fields carry bytes in the session's
+            // result character set. They need not be UTF-8 (for example
+            // koi8r/cp1251), so preserve them byte-for-byte in binary rows.
+            return self.0.to_mysql_bin(w, c);
+        }
+        let text = std::str::from_utf8(self.0)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let unsigned = c.colflags.contains(ColumnFlags::UNSIGNED_FLAG);
+        match c.coltype {
+            ColumnType::MYSQL_TYPE_TINY => {
+                if text.eq_ignore_ascii_case("true") {
+                    return 1_i8.to_mysql_bin(w, c);
+                }
+                if text.eq_ignore_ascii_case("false") {
+                    return 0_i8.to_mysql_bin(w, c);
+                }
+                if unsigned {
+                    text.parse::<u8>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                } else {
+                    text.parse::<i8>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                }
+            }
+            ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => {
+                if unsigned {
+                    text.parse::<u16>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                } else {
+                    text.parse::<i16>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                }
+            }
+            ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => {
+                if unsigned {
+                    text.parse::<u32>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                } else {
+                    text.parse::<i32>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                }
+            }
+            ColumnType::MYSQL_TYPE_LONGLONG => {
+                if unsigned {
+                    text.parse::<u64>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                } else {
+                    text.parse::<i64>().map_err(io_invalid)?.to_mysql_bin(w, c)
+                }
+            }
+            ColumnType::MYSQL_TYPE_FLOAT => {
+                text.parse::<f32>().map_err(io_invalid)?.to_mysql_bin(w, c)
+            }
+            ColumnType::MYSQL_TYPE_DOUBLE => {
+                text.parse::<f64>().map_err(io_invalid)?.to_mysql_bin(w, c)
+            }
+            ColumnType::MYSQL_TYPE_DATE => write_mysql_text_date(w, text),
+            ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+                write_mysql_text_datetime(w, text)
+            }
+            ColumnType::MYSQL_TYPE_TIME => write_mysql_text_time(w, text),
+            _ => self.0.to_mysql_bin(w, c),
+        }
+    }
+}
+
+fn write_mysql_text_date<W: Write>(w: &mut W, text: &str) -> io::Result<()> {
+    let (year, month, day) = mysql_text_date_parts(text)?;
+    if year == 0 && month == 0 && day == 0 {
+        return w.write_u8(0);
+    }
+    w.write_u8(4)?;
+    w.write_u16::<LittleEndian>(year)?;
+    w.write_u8(month)?;
+    w.write_u8(day)
+}
+
+fn write_mysql_text_datetime<W: Write>(w: &mut W, text: &str) -> io::Result<()> {
+    let (date, time) = text
+        .split_once(' ')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid MySQL datetime"))?;
+    let (year, month, day) = mysql_text_date_parts(date)?;
+    let (negative, days, hour, minute, second, micros) = mysql_text_time_parts(time)?;
+    if negative || days != 0 {
+        return Err(io_invalid("invalid MySQL datetime clock"));
+    }
+    if year == 0 && month == 0 && day == 0 && hour == 0 && minute == 0 && second == 0 && micros == 0
+    {
+        return w.write_u8(0);
+    }
+    let length = if micros != 0 {
+        11
+    } else if hour != 0 || minute != 0 || second != 0 {
+        7
+    } else {
+        4
+    };
+    w.write_u8(length)?;
+    w.write_u16::<LittleEndian>(year)?;
+    w.write_u8(month)?;
+    w.write_u8(day)?;
+    if length == 4 {
+        return Ok(());
+    }
+    w.write_u8(hour)?;
+    w.write_u8(minute)?;
+    w.write_u8(second)?;
+    if micros != 0 {
+        w.write_u32::<LittleEndian>(micros)?;
+    }
+    Ok(())
+}
+
+fn write_mysql_text_time<W: Write>(w: &mut W, text: &str) -> io::Result<()> {
+    let (negative, days, hour, minute, second, micros) = mysql_text_time_parts(text)?;
+    if days == 0 && hour == 0 && minute == 0 && second == 0 && micros == 0 {
+        return w.write_u8(0);
+    }
+    w.write_u8(if micros == 0 { 8 } else { 12 })?;
+    w.write_u8(u8::from(negative))?;
+    w.write_u32::<LittleEndian>(days)?;
+    w.write_u8(hour)?;
+    w.write_u8(minute)?;
+    w.write_u8(second)?;
+    if micros != 0 {
+        w.write_u32::<LittleEndian>(micros)?;
+    }
+    Ok(())
+}
+
+fn mysql_text_date_parts(text: &str) -> io::Result<(u16, u8, u8)> {
+    let mut parts = text.split('-');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MySQL date",
+        ));
+    };
+    let (year, month, day) = (
+        year.parse::<u16>().map_err(io_invalid)?,
+        month.parse::<u8>().map_err(io_invalid)?,
+        day.parse::<u8>().map_err(io_invalid)?,
+    );
+    // This is an output getter, not Field::store's calendar validator.
+    // Native temporal Items can expose ALLOW_INVALID_DATES day 32..99;
+    // Protocol_binary writes those actual components without revalidation.
+    if year > 9999 || month > 12 || day > 99 {
+        return Err(io_invalid("invalid MySQL date"));
+    }
+    Ok((year, month, day))
+}
+
+fn mysql_text_time_parts(text: &str) -> io::Result<(bool, u32, u8, u8, u8, u32)> {
+    let (negative, text) = text
+        .strip_prefix('-')
+        .map(|text| (true, text))
+        .unwrap_or((false, text));
+    let (clock, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let mut parts = clock.split(':');
+    let (Some(hour), Some(minute), Some(second), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MySQL time",
+        ));
+    };
+    let total_hours = hour.parse::<u32>().map_err(io_invalid)?;
+    let minute = minute.parse::<u8>().map_err(io_invalid)?;
+    let second = second.parse::<u8>().map_err(io_invalid)?;
+    // Actual temporal Item output may contain STR_TO_DATE's day*24 hours.
+    // Stored/parameter TIME range validation is a separate Field policy.
+    if total_hours > 2399
+        || minute > 59
+        || second > 59
+        || fraction.len() > 6
+        || (text.contains('.') && fraction.is_empty())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MySQL time",
+        ));
+    }
+    let mut micros_text = fraction.to_string();
+    while micros_text.len() < 6 {
+        micros_text.push('0');
+    }
+    let micros = if micros_text.is_empty() {
+        0
+    } else {
+        micros_text.parse::<u32>().map_err(io_invalid)?
+    };
+    Ok((
+        negative,
+        total_hours / 24,
+        (total_hours % 24) as u8,
+        minute,
+        second,
+        micros,
+    ))
+}
+
+fn io_invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
 macro_rules! mysql_text_trivial {
     () => {
         fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {

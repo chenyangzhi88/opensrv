@@ -26,6 +26,8 @@ pub struct ClientHandshake {
     pub(crate) username: Option<Vec<u8>>,
     pub(crate) auth_response: Vec<u8>,
     pub(crate) auth_plugin: Vec<u8>,
+    pub(crate) connection_attrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) zstd_compression_level: Option<u8>,
 }
 
 #[allow(clippy::branches_sharing_code)]
@@ -58,6 +60,8 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                     db: None,
                     auth_response: vec![],
                     auth_plugin: vec![],
+                    connection_attrs: Vec::new(),
+                    zstd_compression_level: None,
                 },
             ));
         }
@@ -74,21 +78,21 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
             if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
                 let (i, size) = read_length_encoded_number(i)?;
                 nom::bytes::complete::take(size)(i)?
-            } else if capabilities.contains(CapabilityFlags::CLIENT_SECURE_CONNECTION) {
+            } else {
+                // MySQL 8.0 HandshakeResponse41 always uses the one-byte
+                // auth length without LENENC_CLIENT_DATA. The old secure
+                // connection bit does not select a NUL-terminated encoding.
                 let (i, size) = nom::number::complete::le_u8(i)?;
                 nom::bytes::complete::take(size)(i)?
-            } else {
-                nom::bytes::complete::take_until(&b"\0"[..])(i)?
             };
 
-        let (i, db) =
-            if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB) && !i.is_empty() {
-                let (i, db) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
-                let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
-                (i, Some(db))
-            } else {
-                (i, None)
-            };
+        let (i, db) = if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB) {
+            let (i, db) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
+            let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
+            (i, Some(db))
+        } else {
+            (i, None)
+        };
 
         let (i, auth_plugin) =
             if capabilities.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) && !i.is_empty() {
@@ -100,6 +104,23 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 (i, &b""[..])
             };
 
+        let (i, connection_attrs) = if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_ATTRS)
+        {
+            parse_connection_attrs(i)?
+        } else {
+            (i, Vec::new())
+        };
+
+        let (i, zstd_compression_level) = if capabilities
+            .contains(CapabilityFlags::CLIENT_ZSTD_COMPRESSION_ALGORITHM)
+            && !i.is_empty()
+        {
+            let (i, level) = nom::number::complete::le_u8(i)?;
+            (i, Some(level))
+        } else {
+            (i, None)
+        };
+
         Ok((
             i,
             ClientHandshake {
@@ -110,6 +131,8 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 db: db.map(|c| c.to_vec()),
                 auth_response: auth_response.to_vec(),
                 auth_plugin: auth_plugin.to_vec(),
+                connection_attrs,
+                zstd_compression_level,
             },
         ))
     } else {
@@ -143,9 +166,35 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 db: db.map(|c| c.to_vec()),
                 auth_response: auth_response.to_vec(),
                 auth_plugin: vec![],
+                connection_attrs: Vec::new(),
+                zstd_compression_level: None,
             },
         ))
     }
+}
+
+fn parse_length_encoded_bytes(i: &[u8]) -> nom::IResult<&[u8], &[u8]> {
+    let (i, size) = read_length_encoded_number(i)?;
+    nom::bytes::complete::take(size)(i)
+}
+
+fn parse_connection_attrs(i: &[u8]) -> nom::IResult<&[u8], Vec<(Vec<u8>, Vec<u8>)>> {
+    let (i, size) = read_length_encoded_number(i)?;
+    if size > 65_535 {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    let (remaining, mut attrs_bytes) = nom::bytes::complete::take(size)(i)?;
+    let mut attrs = Vec::new();
+    while !attrs_bytes.is_empty() {
+        let (rest, key) = parse_length_encoded_bytes(attrs_bytes)?;
+        let (rest, value) = parse_length_encoded_bytes(rest)?;
+        attrs.push((key.to_vec(), value.to_vec()));
+        attrs_bytes = rest;
+    }
+    Ok((remaining, attrs))
 }
 
 fn read_length_encoded_number(i: &[u8]) -> nom::IResult<&[u8], u64> {
@@ -167,11 +216,22 @@ fn read_length_encoded_number(i: &[u8]) -> nom::IResult<&[u8], u64> {
 pub enum Command<'a> {
     Query(&'a [u8]),
     ListFields(&'a [u8]),
+    CreateDatabase(&'a [u8]),
+    DropDatabase(&'a [u8]),
+    Refresh(u8),
+    Shutdown,
+    Statistics,
+    ProcessInfo,
+    ProcessKill(u32),
+    Debug,
+    TableDump(&'a [u8]),
+    SetOption(u16),
     Close(u32),
     Prepare(&'a [u8]),
     Init(&'a [u8]),
     Execute {
         stmt: u32,
+        flags: u8,
         params: &'a [u8],
     },
     SendLongData {
@@ -179,15 +239,39 @@ pub enum Command<'a> {
         param: u16,
         data: &'a [u8],
     },
+    ResetStatement(u32),
+    Fetch {
+        stmt: u32,
+        rows: u32,
+    },
+    ResetConnection,
+    ChangeUser(&'a [u8]),
     Ping,
     Quit,
+    /// A command byte not implemented by this server.  Keeping it explicit
+    /// lets the wire loop return ER_UNKNOWN_COM_ERROR instead of a misleading
+    /// OK packet.
+    Unknown(u8),
 }
 
 pub fn execute(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
     let (i, stmt) = nom::number::complete::le_u32(i)?;
-    let (i, _flags) = nom::bytes::complete::take(1u8)(i)?;
+    let (i, flags) = nom::number::complete::le_u8(i)?;
     let (i, _iterations) = nom::number::complete::le_u32(i)?;
-    Ok((&[], Command::Execute { stmt, params: i }))
+    Ok((
+        &[],
+        Command::Execute {
+            stmt,
+            flags,
+            params: i,
+        },
+    ))
+}
+
+pub fn fetch(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
+    let (i, stmt) = nom::number::complete::le_u32(i)?;
+    let (i, rows) = nom::number::complete::le_u32(i)?;
+    Ok((i, Command::Fetch { stmt, rows }))
 }
 
 pub fn send_long_data(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
@@ -204,39 +288,58 @@ pub fn send_long_data(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
 }
 
 pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
-    use nom::bytes::complete::tag;
-    use nom::combinator::{map, rest};
-    use nom::sequence::preceded;
-    nom::branch::alt((
-        map(
-            preceded(tag(&[CommandByte::COM_QUERY as u8]), rest),
-            Command::Query,
-        ),
-        map(
-            preceded(tag(&[CommandByte::COM_FIELD_LIST as u8]), rest),
-            Command::ListFields,
-        ),
-        map(
-            preceded(tag(&[CommandByte::COM_INIT_DB as u8]), rest),
-            Command::Init,
-        ),
-        map(
-            preceded(tag(&[CommandByte::COM_STMT_PREPARE as u8]), rest),
-            Command::Prepare,
-        ),
-        preceded(tag(&[CommandByte::COM_STMT_EXECUTE as u8]), execute),
-        preceded(
-            tag(&[CommandByte::COM_STMT_SEND_LONG_DATA as u8]),
-            send_long_data,
-        ),
-        map(
-            preceded(
-                tag(&[CommandByte::COM_STMT_CLOSE as u8]),
-                nom::number::complete::le_u32,
-            ),
-            Command::Close,
-        ),
-        map(tag(&[CommandByte::COM_QUIT as u8]), |_| Command::Quit),
-        map(tag(&[CommandByte::COM_PING as u8]), |_| Command::Ping),
-    ))(i)
+    let Some((&command, payload)) = i.split_first() else {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Eof,
+        )));
+    };
+    let parsed = match command {
+        value if value == CommandByte::COM_QUERY as u8 => Command::Query(payload),
+        value if value == CommandByte::COM_FIELD_LIST as u8 => Command::ListFields(payload),
+        value if value == CommandByte::COM_CREATE_DB as u8 => Command::CreateDatabase(payload),
+        value if value == CommandByte::COM_DROP_DB as u8 => Command::DropDatabase(payload),
+        value if value == CommandByte::COM_REFRESH as u8 => {
+            let flag = payload.first().copied().ok_or_else(|| {
+                nom::Err::Error(nom::error::Error::new(payload, nom::error::ErrorKind::Eof))
+            })?;
+            Command::Refresh(flag)
+        }
+        // mysql_common calls command byte 8 COM_DEPRECATED_1; in MySQL 8.0
+        // this is the legacy COM_SHUTDOWN wire value.
+        value if value == CommandByte::COM_DEPRECATED_1 as u8 => Command::Shutdown,
+        value if value == CommandByte::COM_STATISTICS as u8 => Command::Statistics,
+        value if value == CommandByte::COM_PROCESS_INFO as u8 => Command::ProcessInfo,
+        value if value == CommandByte::COM_PROCESS_KILL as u8 => {
+            let (_, id) = nom::number::complete::le_u32(payload)?;
+            Command::ProcessKill(id)
+        }
+        value if value == CommandByte::COM_DEBUG as u8 => Command::Debug,
+        value if value == CommandByte::COM_TABLE_DUMP as u8 => Command::TableDump(payload),
+        value if value == CommandByte::COM_SET_OPTION as u8 => {
+            let (_, option) = nom::number::complete::le_u16(payload)?;
+            Command::SetOption(option)
+        }
+        value if value == CommandByte::COM_INIT_DB as u8 => Command::Init(payload),
+        value if value == CommandByte::COM_STMT_PREPARE as u8 => Command::Prepare(payload),
+        value if value == CommandByte::COM_STMT_EXECUTE as u8 => return execute(payload),
+        value if value == CommandByte::COM_STMT_SEND_LONG_DATA as u8 => {
+            return send_long_data(payload);
+        }
+        value if value == CommandByte::COM_STMT_RESET as u8 => {
+            let (remaining, statement) = nom::number::complete::le_u32(payload)?;
+            return Ok((remaining, Command::ResetStatement(statement)));
+        }
+        value if value == CommandByte::COM_STMT_FETCH as u8 => return fetch(payload),
+        value if value == CommandByte::COM_STMT_CLOSE as u8 => {
+            let (remaining, statement) = nom::number::complete::le_u32(payload)?;
+            return Ok((remaining, Command::Close(statement)));
+        }
+        value if value == CommandByte::COM_QUIT as u8 => Command::Quit,
+        value if value == CommandByte::COM_PING as u8 => Command::Ping,
+        value if value == CommandByte::COM_RESET_CONNECTION as u8 => Command::ResetConnection,
+        value if value == CommandByte::COM_CHANGE_USER as u8 => Command::ChangeUser(payload),
+        value => Command::Unknown(value),
+    };
+    Ok((&[], parsed))
 }

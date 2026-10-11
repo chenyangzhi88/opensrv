@@ -79,14 +79,20 @@ fn main() {
     }
     println!("}}");
     println!("");
-    println!("impl From<u16> for ErrorKind {{");
-    println!("    fn from(x: u16) -> Self {{");
-    println!("        match x {{");
+    println!("impl ErrorKind {{");
+    println!("    pub fn from_code(x: u16) -> Option<Self> {{");
+    println!("        Some(match x {{");
     for &(code, _, ref name, _) in &es {
         println!("            {}_u16 => ErrorKind::{},", code, name);
     }
-    println!("            _ => panic!(\"Unknown error type {{}}\", x),");
-    println!("        }}");
+    println!("            _ => return None,");
+    println!("        }})");
+    println!("    }}");
+    println!("}}");
+    println!("");
+    println!("impl From<u16> for ErrorKind {{");
+    println!("    fn from(x: u16) -> Self {{");
+    println!("        Self::from_code(x).unwrap_or_else(|| panic!(\"Unknown error type {{}}\", x))");
     println!("    }}");
     println!("}}");
     println!("");
@@ -139,6 +145,8 @@ fn main() {
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Ord, PartialOrd)]
 #[repr(u16)]
 pub enum ErrorKind {
+    /// MySQL 8.0.46: user ATTRIBUTE must be a valid JSON object.
+    ER_INVALID_USER_ATTRIBUTE_JSON = 3982,
     /// hashchk
     ER_HASHCHK = 1000,
     /// isamchk
@@ -1911,11 +1919,276 @@ pub enum ErrorKind {
     ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP = 1884,
     /// Slave has more GTIDs than the master has, using the master's SERVER_UUID. This may indicate that the end of the binary log was truncated or that the last binary log file was lost, e.g., after a power or disk failure when sync_binlog != 1. The master may or may not have rolled back transactions that were already replicated to the slave. Suggest to replicate any transactions that master has rolled back from slave to master, and/or commit empty transactions on master to account for transactions that have been committed on master but are not included in GTID_EXECUTED.
     ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER = 1885,
+    /// GET STACKED DIAGNOSTICS requires an active handler.
+    ER_GET_STACKED_DA_WITHOUT_ACTIVE_HANDLER = 3004,
+    /// Foreign key cascade delete/update exceeds the maximum depth.
+    ER_FK_DEPTH_EXCEEDED = 3008,
+    /// A function argument has an incorrect SQL type.
+    ER_INCORRECT_TYPE = 3064,
+    /// This SQL mode is deprecated.
+    ER_WARN_DEPRECATED_SQLMODE = 3090,
+    /// Legacy SQL modes will be merged into strict mode.
+    ER_SQL_MODE_MERGED = 3135,
+    /// Invalid JSON supplied to a function argument.
+    ER_INVALID_JSON_TEXT_IN_PARAM = 3141,
+    /// A JSON path is syntactically invalid.
+    ER_INVALID_JSON_PATH = 3143,
+    /// JSON character input uses an unsupported character set.
+    ER_INVALID_JSON_CHARSET = 3144,
+    /// A function argument is neither a JSON string nor a JSON document.
+    ER_INVALID_TYPE_FOR_JSON = 3146,
+    /// A modifying operation requires a single-location JSON path.
+    ER_INVALID_JSON_PATH_WILDCARD = 3149,
+    /// The JSON document root cannot be removed.
+    ER_JSON_VACUOUS_PATH = 3153,
+    /// A JSON path quantifier must be `one` or `all`.
+    ER_JSON_BAD_ONE_OR_ALL_ARG = 3154,
+    /// An optimizer instruction names no selected table or visible key.
+    ER_UNRESOLVED_HINT_NAME = 3128,
+    /// A numeric JSON value exceeds the range of the requested SQL type.
+    ER_NUMERIC_JSON_VALUE_OUT_OF_RANGE = 3155,
+    /// A JSON_TABLE path has no match and declares ERROR ON EMPTY.
+    ER_MISSING_JSON_TABLE_VALUE = 3665,
+    /// An array/object cannot be stored in a scalar JSON_TABLE column.
+    ER_WRONG_JSON_TABLE_VALUE = 3666,
+    /// A JSON_TABLE target Field conversion failed.
+    ER_JT_VALUE_OUT_OF_RANGE = 3669,
+    /// JSON_TABLE exceeds the native nested-path declaration limit.
+    ER_JT_MAX_NESTED_PATH = 3670,
+    /// A datetime delimiter is accepted but deprecated.
+    ER_WARN_DEPRECATED_DATETIME_DELIMITER = 4095,
+    /// An accepted datetime delimiter is superfluous and deprecated.
+    ER_WARN_DEPRECATED_SUPERFLUOUS_DELIMITER = 4096,
+    /// A JSON value cannot be converted to the requested SQL type.
+    ER_INVALID_JSON_VALUE_FOR_CAST = 3156,
+    /// A JSON document exceeds the maximum permitted depth.
+    ER_JSON_DOCUMENT_TOO_DEEP = 3157,
+    /// JSON documents may not contain NULL member names.
+    ER_JSON_DOCUMENT_NULL_KEY = 3158,
+    /// A function argument requires a particular JSON type, such as an object schema.
+    ER_INVALID_JSON_TYPE = 3853,
+    /// JSON Schema validation in a CHECK execution context failed with a detailed report.
+    ER_JSON_SCHEMA_VALIDATION_ERROR_WITH_DETAILED_REPORT = 3934,
+    /// An AES key exceeds the selected block encryption key width without a KDF.
+    WARN_AES_KEY_SIZE = 3237,
+    /// An AES KDF name is neither hkdf nor pbkdf2_hmac.
+    ER_AES_INVALID_KDF_NAME = 3235,
+    /// PBKDF2 iterations are outside the native permitted range.
+    ER_AES_INVALID_KDF_ITERATIONS = 3236,
+    /// An AES KDF option is NULL or exceeds its byte bound.
+    ER_AES_INVALID_KDF_OPTION_SIZE = 3238,
+    /// The requested role is not granted to this authorization identity.
+    ER_ROLE_NOT_GRANTED = 3530,
+    /// The client does not support an optional protocol feature.
+    ER_CLIENT_DOES_NOT_SUPPORT = 3640,
+    /// The referencing and referenced foreign-key columns are incompatible.
+    ER_FK_INCOMPATIBLE_COLUMNS = 3780,
+    /// A CHECK constraint cannot refer to an AUTO_INCREMENT column.
+    ER_CHECK_CONSTRAINT_REFERS_AUTO_INCREMENT_COLUMN = 3818,
+    /// Check constraint is violated.
+    ER_CHECK_CONSTRAINT_VIOLATED = 3819,
+    /// The SQL mode bitmask contains modes removed in MySQL 8.0.
+    ER_UNSUPPORTED_SQL_MODE = 3899,
+    /// Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.
+    ER_LOCK_NOWAIT = 3572,
+    /// The client selected a compression algorithm that the server configuration disallows.
+    ER_WRONG_COMPRESSION_ALGORITHM_CLIENT = 3922,
+    /// The client negotiated zstd with a level outside the native 1..=22 range.
+    ER_WRONG_COMPRESSION_LEVEL_CLIENT = 3923,
+    /// The partition function expression is too long.
+    ER_PART_EXPR_TOO_LONG = 3622,
+    /// Recursive query iteration limit was exceeded.
+    ER_CTE_MAX_RECURSION_DEPTH = 3636,
+    ER_VAR_DOES_NOT_EXIST = 3615,
+    ER_PERSIST_ONLY_ACCESS_DENIED_ERROR = 3630,
+    /// Column has a partitioning function dependency and cannot be dropped or renamed.
+    ER_DEPENDENT_BY_PARTITION_FUNC = 3855,
+    /// A string cannot be converted to the operation's character set.
+    ER_CANNOT_CONVERT_STRING = 3854,
+    /// A named function is not allowed in a generated column expression.
+    ER_GENERATED_COLUMN_NAMED_FUNCTION_IS_NOT_ALLOWED = 3763,
+    /// SET PASSWORD has no significance for an authentication plugin that does not store password data in the server.
+    ER_SET_PASSWORD_AUTH_PLUGIN_ERROR = 4102,
+    /// Credentials conflict with the account's password history policy.
+    ER_CREDENTIALS_CONTRADICT_TO_HISTORY = 3638,
+    /// A non-zero password history clause is ignored by this authentication plugin.
+    ER_WARNING_PASSWORD_HISTORY_CLAUSES_VOID = 3639,
+    /// RETAIN CURRENT PASSWORD is ignored by an external authentication plugin.
+    ER_WARNING_RETAIN_CURRENT_PASSWORD_CLAUSE_VOID = 13294,
+    /// DISCARD OLD PASSWORD is ignored by an external authentication plugin.
+    ER_WARNING_DISCARD_OLD_PASSWORD_CLAUSE_VOID = 13295,
+    /// The current password supplied in REPLACE is incorrect.
+    ER_INCORRECT_CURRENT_PASSWORD = 3891,
+    /// The account policy requires its current password in REPLACE.
+    ER_MISSING_CURRENT_PASSWORD = 3892,
+    /// A current password cannot be supplied when changing another user.
+    ER_CURRENT_PASSWORD_NOT_REQUIRED = 3893,
+    /// Binary geometry arguments have different SRIDs.
+    ER_GIS_DIFFERENT_SRIDS = 3033,
+    /// Unknown GIS error.
+    ER_GIS_UNKNOWN_ERROR = 3035,
+    /// Invalid GIS data.
+    ER_GIS_INVALID_DATA = 3037,
+    /// A geometry exceeds the maximum number of points.
+    ER_GIS_MAX_POINTS_IN_GEOMETRY_OVERFLOWED = 3134,
+    /// NET mutation is unavailable to pluggable protocols.
+    ER_PLUGGABLE_PROTOCOL_COMMAND_NOT_SUPPORTED = 3130,
+    /// The authenticated connection does not use a secure transport.
+    ER_SECURE_TRANSPORT_REQUIRED = 3159,
+    /// No secure transport is configured (native Windows configuration gate).
+    ER_NO_SECURE_TRANSPORTS_CONFIGURED = 3160,
+    /// Native IF EXISTS account Note.
+    ER_USER_DOES_NOT_EXIST = 3162,
+    /// Native IF NOT EXISTS account Note.
+    ER_USER_ALREADY_EXISTS = 3163,
+    /// GRANT ... AS is supported only for global privileges.
+    ER_UNSUPPORTED_USE_OF_GRANT_AS = 3835,
+    /// Invalid AS authorization IDs or insufficient AS privileges.
+    ER_UKNOWN_AUTH_ID_OR_ACCESS_DENIED_FOR_GRANT_AS = 3836,
+    /// Existing database restrictions prevent disabling partial_revokes.
+    ER_PARTIAL_REVOKES_EXIST = 3896,
+    /// DROP TABLE references a real parent foreign key, unlike row DELETE.
+    ER_FK_CANNOT_DROP_PARENT = 3730,
+    /// A geometry has an unexpected type.
+    ER_UNEXPECTED_GEOMETRY_TYPE = 3516,
+    /// An SRS definition cannot be parsed.
+    ER_SRS_PARSE_ERROR = 3517,
+    /// An SRS referenced by a warning does not exist.
+    ER_WARN_SRS_NOT_FOUND = 3519,
+    /// A function requires a Cartesian SRS.
+    ER_SRS_NOT_CARTESIAN = 3520,
+    /// A function requires a defined Cartesian SRS.
+    ER_SRS_NOT_CARTESIAN_UNDEFINED = 3521,
+    /// An SRS does not exist.
+    ER_SRS_NOT_FOUND = 3548,
+    /// The operation is not implemented for a geographic SRS.
+    ER_NOT_IMPLEMENTED_FOR_GEOGRAPHIC_SRS = 3618,
+    /// A geometry has the wrong SRID for its column.
+    ER_WRONG_SRID_FOR_COLUMN = 3643,
+    /// The operation is not implemented for a Cartesian SRS.
+    ER_NOT_IMPLEMENTED_FOR_CARTESIAN_SRS = 3704,
+    /// The operation is not implemented for a projected SRS.
+    ER_NOT_IMPLEMENTED_FOR_PROJECTED_SRS = 3705,
+    /// A mandatory SRS attribute is missing.
+    ER_SRS_MISSING_MANDATORY_ATTRIBUTE = 3708,
+    /// An SRS attribute has multiple definitions.
+    ER_SRS_MULTIPLE_ATTRIBUTE_DEFINITIONS = 3709,
+    /// An SRS name cannot be empty or surrounded by whitespace.
+    ER_SRS_NAME_CANT_BE_EMPTY_OR_WHITESPACE = 3710,
+    /// An SRS organization cannot be empty or surrounded by whitespace.
+    ER_SRS_ORGANIZATION_CANT_BE_EMPTY_OR_WHITESPACE = 3711,
+    /// An SRS ID already exists.
+    ER_SRS_ID_ALREADY_EXISTS = 3712,
+    /// An SRS ID already exists (warning).
+    ER_WARN_SRS_ID_ALREADY_EXISTS = 3713,
+    /// SRID 0 cannot be modified.
+    ER_CANT_MODIFY_SRID_0 = 3714,
+    /// The SRID belongs to a reserved range.
+    ER_WARN_RESERVED_SRID_RANGE = 3715,
+    /// An SRS cannot be modified while a column depends on it.
+    ER_CANT_MODIFY_SRS_USED_BY_COLUMN = 3716,
+    /// An SRS attribute contains an invalid character.
+    ER_SRS_INVALID_CHARACTER_IN_ATTRIBUTE = 3717,
+    /// An SRS attribute string is too long.
+    ER_SRS_ATTRIBUTE_STRING_TOO_LONG = 3718,
+    /// The UTF8 character-set alias will change from UTF8MB3 to UTF8MB4.
+    ER_WARN_DEPRECATED_UTF8_ALIAS = 3719,
+    /// NATIONAL/NCHAR/NVARCHAR implies the deprecated UTF8MB3 character set.
+    ER_WARN_DEPRECATED_UTF8MB3 = 3720,
+    /// UTF8MB3 collation names are deprecated in favor of UTF8MB4 collations.
+    ER_WARN_DEPRECATED_UTF8MB3_COLLATION = 3778,
+    /// A collation belongs to a deprecated UCS2, MACROMAN, MACCE, DEC8 or HP8 character set.
+    ER_WARN_DEPRECATED_COLLATION = 4079,
+    /// User-defined (noncompiled) collations are deprecated.
+    ER_WARN_DEPRECATED_USER_DEFINED_COLLATIONS = 4162,
+    /// A function requires a geographic SRS.
+    ER_SRS_NOT_GEOGRAPHIC = 3726,
+    /// A geometry longitude is outside the SRS domain.
+    ER_GEOMETRY_PARAM_LONGITUDE_OUT_OF_RANGE = 3731,
+    /// A geometry latitude is outside the SRS domain.
+    ER_GEOMETRY_PARAM_LATITUDE_OUT_OF_RANGE = 3732,
+    /// A geographic SRS has invalid axes.
+    ER_SRS_GEOGCS_INVALID_AXES = 3736,
+    /// An SRS has an invalid semi-major axis.
+    ER_SRS_INVALID_SEMI_MAJOR_AXIS = 3737,
+    /// An SRS has invalid inverse flattening.
+    ER_SRS_INVALID_INVERSE_FLATTENING = 3738,
+    /// An SRS has an invalid angular unit.
+    ER_SRS_INVALID_ANGULAR_UNIT = 3739,
+    /// An SRS has an invalid prime meridian.
+    ER_SRS_INVALID_PRIME_MERIDIAN = 3740,
+    /// The source SRS is not supported for transformation.
+    ER_TRANSFORM_SOURCE_SRS_NOT_SUPPORTED = 3741,
+    /// The target SRS is not supported for transformation.
+    ER_TRANSFORM_TARGET_SRS_NOT_SUPPORTED = 3742,
+    /// The source SRS is missing the TOWGS84 transform clause.
+    ER_TRANSFORM_SOURCE_SRS_MISSING_TOWGS84 = 3743,
+    /// The target SRS is missing the TOWGS84 transform clause.
+    ER_TRANSFORM_TARGET_SRS_MISSING_TOWGS84 = 3744,
+    /// A table must have at least one visible column.
+    ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN = 4028,
+    /// An SRS has an invalid latitude of origin.
+    ER_SRS_INVALID_LATITUDE_OF_ORIGIN = 4105,
+    /// An SRS has an invalid longitude of origin.
+    ER_SRS_INVALID_LONGITUDE_OF_ORIGIN = 4106,
+    /// An SRS contains an unused projection parameter.
+    ER_SRS_UNUSED_PROJ_PARAMETER_PRESENT = 4107,
+    /// An SRS has an invalid height parameter.
+    ER_SRS_INVALID_HEIGHT = 4124,
+    /// An SRS has an invalid scaling parameter.
+    ER_SRS_INVALID_SCALING = 4125,
+    /// An SRS has an invalid zone width.
+    ER_SRS_INVALID_ZONE_WIDTH = 4126,
+    /// A Polar Stereographic variant A SRS has an invalid latitude of origin.
+    ER_SRS_INVALID_LATITUDE_POLAR_STERE_VAR_A = 4127,
+    /// A logarithm received a base or value outside its mathematical domain.
+    ER_INVALID_ARGUMENT_FOR_LOGARITHM = 3020,
+    /// Temporary tables cannot be accessed in a detached-on-prepare XA branch.
+    ER_XA_TEMP_TABLE = 4091,
+    /// FOLLOWS or PRECEDES refers to no trigger in the same chain.
+    ER_REFERENCED_TRG_DOES_NOT_EXIST = 3011,
+    /// IF NOT EXISTS cannot accept a trigger already attached to another table.
+    ER_IF_NOT_EXISTS_UNSUPPORTED_TRG_EXISTS_ON_DIFFERENT_TABLE = 4100,
+    /// The statement execution timer elapsed (not a lock timeout).
+    ER_QUERY_TIMEOUT = 3024,
+    /// A newly created user-variable name fails native name validation.
+    ER_ILLEGAL_USER_VAR = 3061,
+    /// A functional-index generated expression truncated a value.
+    ER_WARN_DATA_TRUNCATED_FUNCTIONAL_INDEX = 3751,
+    /// A functional-index generated expression produced an out-of-range value.
+    ER_WARN_DATA_OUT_OF_RANGE_FUNCTIONAL_INDEX = 3752,
+    /// A functional-index expression references an auto-increment column.
+    ER_FUNCTIONAL_INDEX_REF_AUTO_INCREMENT = 3754,
+    /// A functional-index expression references a row value.
+    ER_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED = 3800,
+    /// A functional-index carrier cannot store the expression's payload.
+    ER_FUNCTIONAL_INDEX_DATA_IS_TOO_LONG = 3907,
+    /// A write targets an actual schema whose durable READ ONLY option is on.
+    ER_SCHEMA_READ_ONLY = 3989,
+    /// The actual ALTER DATABASE target was not found in the dictionary.
+    ER_NO_SUCH_DB = 3503,
+    /// An ENUM declaration has more than 65535 slots.
+    ER_TOO_BIG_ENUM = 3504,
+    /// An ENUM/SET member has more than 255 native characters.
+    ER_TOO_LONG_SET_ENUM_VALUE = 3505,
+    /// An application cannot alter the protected dictionary schema.
+    ER_NO_SYSTEM_SCHEMA_ACCESS = 3552,
 }
 
-impl From<u16> for ErrorKind {
-    fn from(x: u16) -> Self {
-        match x {
+impl ErrorKind {
+    /// Resolve a known native error without rejecting valid user-defined codes.
+    pub fn from_code(x: u16) -> Option<Self> {
+        Some(match x {
+            3751_u16 => ErrorKind::ER_WARN_DATA_TRUNCATED_FUNCTIONAL_INDEX,
+            3752_u16 => ErrorKind::ER_WARN_DATA_OUT_OF_RANGE_FUNCTIONAL_INDEX,
+            3754_u16 => ErrorKind::ER_FUNCTIONAL_INDEX_REF_AUTO_INCREMENT,
+            3800_u16 => ErrorKind::ER_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED,
+            3907_u16 => ErrorKind::ER_FUNCTIONAL_INDEX_DATA_IS_TOO_LONG,
+            3989_u16 => ErrorKind::ER_SCHEMA_READ_ONLY,
+            3503_u16 => ErrorKind::ER_NO_SUCH_DB,
+            3504_u16 => ErrorKind::ER_TOO_BIG_ENUM,
+            3505_u16 => ErrorKind::ER_TOO_LONG_SET_ENUM_VALUE,
+            3552_u16 => ErrorKind::ER_NO_SYSTEM_SCHEMA_ACCESS,
             1000_u16 => ErrorKind::ER_HASHCHK,
             1001_u16 => ErrorKind::ER_NISAMCHK,
             1002_u16 => ErrorKind::ER_NO,
@@ -2804,8 +3077,133 @@ impl From<u16> for ErrorKind {
             1883_u16 => ErrorKind::ER_PLUGIN_CANNOT_BE_UNINSTALLED,
             1884_u16 => ErrorKind::ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP,
             1885_u16 => ErrorKind::ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER,
-            _ => panic!("Unknown error type {x}"),
-        }
+            3004_u16 => ErrorKind::ER_GET_STACKED_DA_WITHOUT_ACTIVE_HANDLER,
+            3008_u16 => ErrorKind::ER_FK_DEPTH_EXCEEDED,
+            3064_u16 => ErrorKind::ER_INCORRECT_TYPE,
+            3090_u16 => ErrorKind::ER_WARN_DEPRECATED_SQLMODE,
+            3135_u16 => ErrorKind::ER_SQL_MODE_MERGED,
+            3141_u16 => ErrorKind::ER_INVALID_JSON_TEXT_IN_PARAM,
+            3143_u16 => ErrorKind::ER_INVALID_JSON_PATH,
+            3144_u16 => ErrorKind::ER_INVALID_JSON_CHARSET,
+            3146_u16 => ErrorKind::ER_INVALID_TYPE_FOR_JSON,
+            3530_u16 => ErrorKind::ER_ROLE_NOT_GRANTED,
+            3640_u16 => ErrorKind::ER_CLIENT_DOES_NOT_SUPPORT,
+            3149_u16 => ErrorKind::ER_INVALID_JSON_PATH_WILDCARD,
+            3153_u16 => ErrorKind::ER_JSON_VACUOUS_PATH,
+            3154_u16 => ErrorKind::ER_JSON_BAD_ONE_OR_ALL_ARG,
+            3128_u16 => ErrorKind::ER_UNRESOLVED_HINT_NAME,
+            3155_u16 => ErrorKind::ER_NUMERIC_JSON_VALUE_OUT_OF_RANGE,
+            3665_u16 => ErrorKind::ER_MISSING_JSON_TABLE_VALUE,
+            3666_u16 => ErrorKind::ER_WRONG_JSON_TABLE_VALUE,
+            3669_u16 => ErrorKind::ER_JT_VALUE_OUT_OF_RANGE,
+            3670_u16 => ErrorKind::ER_JT_MAX_NESTED_PATH,
+            4095_u16 => ErrorKind::ER_WARN_DEPRECATED_DATETIME_DELIMITER,
+            4096_u16 => ErrorKind::ER_WARN_DEPRECATED_SUPERFLUOUS_DELIMITER,
+            3156_u16 => ErrorKind::ER_INVALID_JSON_VALUE_FOR_CAST,
+            3157_u16 => ErrorKind::ER_JSON_DOCUMENT_TOO_DEEP,
+            3158_u16 => ErrorKind::ER_JSON_DOCUMENT_NULL_KEY,
+            3853_u16 => ErrorKind::ER_INVALID_JSON_TYPE,
+            3934_u16 => ErrorKind::ER_JSON_SCHEMA_VALIDATION_ERROR_WITH_DETAILED_REPORT,
+            3237_u16 => ErrorKind::WARN_AES_KEY_SIZE,
+            3235_u16 => ErrorKind::ER_AES_INVALID_KDF_NAME,
+            3236_u16 => ErrorKind::ER_AES_INVALID_KDF_ITERATIONS,
+            3238_u16 => ErrorKind::ER_AES_INVALID_KDF_OPTION_SIZE,
+            3780_u16 => ErrorKind::ER_FK_INCOMPATIBLE_COLUMNS,
+            3818_u16 => ErrorKind::ER_CHECK_CONSTRAINT_REFERS_AUTO_INCREMENT_COLUMN,
+            3819_u16 => ErrorKind::ER_CHECK_CONSTRAINT_VIOLATED,
+            3899_u16 => ErrorKind::ER_UNSUPPORTED_SQL_MODE,
+            3572_u16 => ErrorKind::ER_LOCK_NOWAIT,
+            3922_u16 => ErrorKind::ER_WRONG_COMPRESSION_ALGORITHM_CLIENT,
+            3923_u16 => ErrorKind::ER_WRONG_COMPRESSION_LEVEL_CLIENT,
+            3622_u16 => ErrorKind::ER_PART_EXPR_TOO_LONG,
+            3636_u16 => ErrorKind::ER_CTE_MAX_RECURSION_DEPTH,
+            3615_u16 => ErrorKind::ER_VAR_DOES_NOT_EXIST,
+            3630_u16 => ErrorKind::ER_PERSIST_ONLY_ACCESS_DENIED_ERROR,
+            3855_u16 => ErrorKind::ER_DEPENDENT_BY_PARTITION_FUNC,
+            3854_u16 => ErrorKind::ER_CANNOT_CONVERT_STRING,
+            3763_u16 => ErrorKind::ER_GENERATED_COLUMN_NAMED_FUNCTION_IS_NOT_ALLOWED,
+            4102_u16 => ErrorKind::ER_SET_PASSWORD_AUTH_PLUGIN_ERROR,
+            3638_u16 => ErrorKind::ER_CREDENTIALS_CONTRADICT_TO_HISTORY,
+            3639_u16 => ErrorKind::ER_WARNING_PASSWORD_HISTORY_CLAUSES_VOID,
+            13294_u16 => ErrorKind::ER_WARNING_RETAIN_CURRENT_PASSWORD_CLAUSE_VOID,
+            13295_u16 => ErrorKind::ER_WARNING_DISCARD_OLD_PASSWORD_CLAUSE_VOID,
+            3891_u16 => ErrorKind::ER_INCORRECT_CURRENT_PASSWORD,
+            3892_u16 => ErrorKind::ER_MISSING_CURRENT_PASSWORD,
+            3893_u16 => ErrorKind::ER_CURRENT_PASSWORD_NOT_REQUIRED,
+            3033_u16 => ErrorKind::ER_GIS_DIFFERENT_SRIDS,
+            3035_u16 => ErrorKind::ER_GIS_UNKNOWN_ERROR,
+            3037_u16 => ErrorKind::ER_GIS_INVALID_DATA,
+            3134_u16 => ErrorKind::ER_GIS_MAX_POINTS_IN_GEOMETRY_OVERFLOWED,
+            3130_u16 => ErrorKind::ER_PLUGGABLE_PROTOCOL_COMMAND_NOT_SUPPORTED,
+            3159_u16 => ErrorKind::ER_SECURE_TRANSPORT_REQUIRED,
+            3160_u16 => ErrorKind::ER_NO_SECURE_TRANSPORTS_CONFIGURED,
+            3162_u16 => ErrorKind::ER_USER_DOES_NOT_EXIST,
+            3163_u16 => ErrorKind::ER_USER_ALREADY_EXISTS,
+            3835_u16 => ErrorKind::ER_UNSUPPORTED_USE_OF_GRANT_AS,
+            3836_u16 => ErrorKind::ER_UKNOWN_AUTH_ID_OR_ACCESS_DENIED_FOR_GRANT_AS,
+            3896_u16 => ErrorKind::ER_PARTIAL_REVOKES_EXIST,
+            3730_u16 => ErrorKind::ER_FK_CANNOT_DROP_PARENT,
+            3516_u16 => ErrorKind::ER_UNEXPECTED_GEOMETRY_TYPE,
+            3517_u16 => ErrorKind::ER_SRS_PARSE_ERROR,
+            3519_u16 => ErrorKind::ER_WARN_SRS_NOT_FOUND,
+            3520_u16 => ErrorKind::ER_SRS_NOT_CARTESIAN,
+            3521_u16 => ErrorKind::ER_SRS_NOT_CARTESIAN_UNDEFINED,
+            3548_u16 => ErrorKind::ER_SRS_NOT_FOUND,
+            3618_u16 => ErrorKind::ER_NOT_IMPLEMENTED_FOR_GEOGRAPHIC_SRS,
+            3643_u16 => ErrorKind::ER_WRONG_SRID_FOR_COLUMN,
+            3704_u16 => ErrorKind::ER_NOT_IMPLEMENTED_FOR_CARTESIAN_SRS,
+            3705_u16 => ErrorKind::ER_NOT_IMPLEMENTED_FOR_PROJECTED_SRS,
+            3708_u16 => ErrorKind::ER_SRS_MISSING_MANDATORY_ATTRIBUTE,
+            3709_u16 => ErrorKind::ER_SRS_MULTIPLE_ATTRIBUTE_DEFINITIONS,
+            3710_u16 => ErrorKind::ER_SRS_NAME_CANT_BE_EMPTY_OR_WHITESPACE,
+            3711_u16 => ErrorKind::ER_SRS_ORGANIZATION_CANT_BE_EMPTY_OR_WHITESPACE,
+            3712_u16 => ErrorKind::ER_SRS_ID_ALREADY_EXISTS,
+            3713_u16 => ErrorKind::ER_WARN_SRS_ID_ALREADY_EXISTS,
+            3714_u16 => ErrorKind::ER_CANT_MODIFY_SRID_0,
+            3715_u16 => ErrorKind::ER_WARN_RESERVED_SRID_RANGE,
+            3716_u16 => ErrorKind::ER_CANT_MODIFY_SRS_USED_BY_COLUMN,
+            3717_u16 => ErrorKind::ER_SRS_INVALID_CHARACTER_IN_ATTRIBUTE,
+            3718_u16 => ErrorKind::ER_SRS_ATTRIBUTE_STRING_TOO_LONG,
+            3719_u16 => ErrorKind::ER_WARN_DEPRECATED_UTF8_ALIAS,
+            3720_u16 => ErrorKind::ER_WARN_DEPRECATED_UTF8MB3,
+            3778_u16 => ErrorKind::ER_WARN_DEPRECATED_UTF8MB3_COLLATION,
+            4079_u16 => ErrorKind::ER_WARN_DEPRECATED_COLLATION,
+            4162_u16 => ErrorKind::ER_WARN_DEPRECATED_USER_DEFINED_COLLATIONS,
+            3726_u16 => ErrorKind::ER_SRS_NOT_GEOGRAPHIC,
+            3731_u16 => ErrorKind::ER_GEOMETRY_PARAM_LONGITUDE_OUT_OF_RANGE,
+            3732_u16 => ErrorKind::ER_GEOMETRY_PARAM_LATITUDE_OUT_OF_RANGE,
+            3736_u16 => ErrorKind::ER_SRS_GEOGCS_INVALID_AXES,
+            3737_u16 => ErrorKind::ER_SRS_INVALID_SEMI_MAJOR_AXIS,
+            3738_u16 => ErrorKind::ER_SRS_INVALID_INVERSE_FLATTENING,
+            3739_u16 => ErrorKind::ER_SRS_INVALID_ANGULAR_UNIT,
+            3740_u16 => ErrorKind::ER_SRS_INVALID_PRIME_MERIDIAN,
+            3741_u16 => ErrorKind::ER_TRANSFORM_SOURCE_SRS_NOT_SUPPORTED,
+            3742_u16 => ErrorKind::ER_TRANSFORM_TARGET_SRS_NOT_SUPPORTED,
+            3743_u16 => ErrorKind::ER_TRANSFORM_SOURCE_SRS_MISSING_TOWGS84,
+            3744_u16 => ErrorKind::ER_TRANSFORM_TARGET_SRS_MISSING_TOWGS84,
+            4028_u16 => ErrorKind::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+            4091_u16 => ErrorKind::ER_XA_TEMP_TABLE,
+            3011_u16 => ErrorKind::ER_REFERENCED_TRG_DOES_NOT_EXIST,
+            4100_u16 => ErrorKind::ER_IF_NOT_EXISTS_UNSUPPORTED_TRG_EXISTS_ON_DIFFERENT_TABLE,
+            4105_u16 => ErrorKind::ER_SRS_INVALID_LATITUDE_OF_ORIGIN,
+            4106_u16 => ErrorKind::ER_SRS_INVALID_LONGITUDE_OF_ORIGIN,
+            4107_u16 => ErrorKind::ER_SRS_UNUSED_PROJ_PARAMETER_PRESENT,
+            4124_u16 => ErrorKind::ER_SRS_INVALID_HEIGHT,
+            4125_u16 => ErrorKind::ER_SRS_INVALID_SCALING,
+            4126_u16 => ErrorKind::ER_SRS_INVALID_ZONE_WIDTH,
+            4127_u16 => ErrorKind::ER_SRS_INVALID_LATITUDE_POLAR_STERE_VAR_A,
+            3020_u16 => ErrorKind::ER_INVALID_ARGUMENT_FOR_LOGARITHM,
+            3982_u16 => ErrorKind::ER_INVALID_USER_ATTRIBUTE_JSON,
+            3024_u16 => ErrorKind::ER_QUERY_TIMEOUT,
+            3061_u16 => ErrorKind::ER_ILLEGAL_USER_VAR,
+            _ => return None,
+        })
+    }
+}
+
+impl From<u16> for ErrorKind {
+    fn from(x: u16) -> Self {
+        Self::from_code(x).unwrap_or_else(|| panic!("Unknown error type {x}"))
     }
 }
 
@@ -2829,6 +3227,93 @@ impl ErrorKind {
     /// See also https://mariadb.com/kb/en/library/sqlstate/
     pub fn sqlstate(self) -> &'static [u8; 5] {
         match self {
+            ErrorKind::ER_WARN_DATA_TRUNCATED_FUNCTIONAL_INDEX => b"01000",
+            ErrorKind::ER_WARN_DATA_OUT_OF_RANGE_FUNCTIONAL_INDEX => b"22003",
+            ErrorKind::ER_FUNCTIONAL_INDEX_REF_AUTO_INCREMENT
+            | ErrorKind::ER_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED => b"HY000",
+            ErrorKind::ER_FUNCTIONAL_INDEX_DATA_IS_TOO_LONG => b"22001",
+            ErrorKind::ER_WARN_SRS_NOT_FOUND => b"01000",
+            ErrorKind::ER_WARN_SRS_ID_ALREADY_EXISTS => b"01S00",
+            ErrorKind::ER_WARN_RESERVED_SRID_RANGE => b"01S01",
+            ErrorKind::ER_SRS_NOT_FOUND | ErrorKind::ER_SRS_NOT_CARTESIAN_UNDEFINED => b"SR001",
+            ErrorKind::ER_SRS_PARSE_ERROR
+            | ErrorKind::ER_SRS_GEOGCS_INVALID_AXES
+            | ErrorKind::ER_SRS_INVALID_SEMI_MAJOR_AXIS
+            | ErrorKind::ER_SRS_INVALID_INVERSE_FLATTENING
+            | ErrorKind::ER_SRS_INVALID_ANGULAR_UNIT
+            | ErrorKind::ER_SRS_INVALID_PRIME_MERIDIAN
+            | ErrorKind::ER_SRS_INVALID_LATITUDE_OF_ORIGIN
+            | ErrorKind::ER_SRS_INVALID_LONGITUDE_OF_ORIGIN
+            | ErrorKind::ER_SRS_UNUSED_PROJ_PARAMETER_PRESENT
+            | ErrorKind::ER_SRS_INVALID_HEIGHT
+            | ErrorKind::ER_SRS_INVALID_SCALING
+            | ErrorKind::ER_SRS_INVALID_ZONE_WIDTH
+            | ErrorKind::ER_SRS_INVALID_LATITUDE_POLAR_STERE_VAR_A => b"SR002",
+            ErrorKind::ER_SRS_ID_ALREADY_EXISTS => b"SR004",
+            ErrorKind::ER_CANT_MODIFY_SRID_0 => b"SR000",
+            ErrorKind::ER_CANT_MODIFY_SRS_USED_BY_COLUMN => b"SR005",
+            ErrorKind::ER_SRS_MISSING_MANDATORY_ATTRIBUTE
+            | ErrorKind::ER_SRS_MULTIPLE_ATTRIBUTE_DEFINITIONS
+            | ErrorKind::ER_SRS_NAME_CANT_BE_EMPTY_OR_WHITESPACE
+            | ErrorKind::ER_SRS_ORGANIZATION_CANT_BE_EMPTY_OR_WHITESPACE
+            | ErrorKind::ER_SRS_INVALID_CHARACTER_IN_ATTRIBUTE
+            | ErrorKind::ER_SRS_ATTRIBUTE_STRING_TOO_LONG => b"SR006",
+            ErrorKind::ER_GIS_INVALID_DATA => b"22023",
+            ErrorKind::ER_UNEXPECTED_GEOMETRY_TYPE => b"22S01",
+            ErrorKind::ER_GEOMETRY_PARAM_LONGITUDE_OUT_OF_RANGE => b"22S02",
+            ErrorKind::ER_GEOMETRY_PARAM_LATITUDE_OUT_OF_RANGE => b"22S03",
+            ErrorKind::ER_NOT_IMPLEMENTED_FOR_GEOGRAPHIC_SRS
+            | ErrorKind::ER_NOT_IMPLEMENTED_FOR_CARTESIAN_SRS
+            | ErrorKind::ER_NOT_IMPLEMENTED_FOR_PROJECTED_SRS
+            | ErrorKind::ER_SRS_NOT_CARTESIAN
+            | ErrorKind::ER_SRS_NOT_GEOGRAPHIC
+            | ErrorKind::ER_TRANSFORM_SOURCE_SRS_NOT_SUPPORTED
+            | ErrorKind::ER_TRANSFORM_TARGET_SRS_NOT_SUPPORTED
+            | ErrorKind::ER_TRANSFORM_SOURCE_SRS_MISSING_TOWGS84
+            | ErrorKind::ER_TRANSFORM_TARGET_SRS_MISSING_TOWGS84 => b"22S00",
+            ErrorKind::ER_GIS_DIFFERENT_SRIDS
+            | ErrorKind::ER_GIS_UNKNOWN_ERROR
+            | ErrorKind::ER_GIS_MAX_POINTS_IN_GEOMETRY_OVERFLOWED
+            | ErrorKind::ER_PLUGGABLE_PROTOCOL_COMMAND_NOT_SUPPORTED
+            | ErrorKind::ER_SECURE_TRANSPORT_REQUIRED
+            | ErrorKind::ER_NO_SECURE_TRANSPORTS_CONFIGURED
+            | ErrorKind::ER_WRONG_SRID_FOR_COLUMN => b"HY000",
+            ErrorKind::ER_INCORRECT_TYPE
+            | ErrorKind::ER_WARN_DEPRECATED_SQLMODE
+            | ErrorKind::ER_SQL_MODE_MERGED
+            | ErrorKind::ER_ROLE_NOT_GRANTED => b"HY000",
+            ErrorKind::ER_INVALID_JSON_TEXT_IN_PARAM
+            | ErrorKind::ER_INVALID_JSON_CHARSET
+            | ErrorKind::ER_INVALID_TYPE_FOR_JSON
+            | ErrorKind::ER_JSON_DOCUMENT_TOO_DEEP
+            | ErrorKind::ER_INVALID_JSON_TYPE
+            | ErrorKind::ER_JSON_DOCUMENT_NULL_KEY => b"22032",
+            ErrorKind::ER_INVALID_JSON_VALUE_FOR_CAST => b"22018",
+            ErrorKind::ER_NUMERIC_JSON_VALUE_OUT_OF_RANGE => b"22003",
+            ErrorKind::ER_MISSING_JSON_TABLE_VALUE => b"22035",
+            ErrorKind::ER_WRONG_JSON_TABLE_VALUE => b"2203F",
+            ErrorKind::ER_JT_VALUE_OUT_OF_RANGE => b"22003",
+            ErrorKind::ER_JT_MAX_NESTED_PATH => b"42000",
+            ErrorKind::ER_WRONG_COMPRESSION_LEVEL_CLIENT => b"HY000",
+            ErrorKind::ER_WARN_DEPRECATED_DATETIME_DELIMITER
+            | ErrorKind::ER_WARN_DEPRECATED_SUPERFLUOUS_DELIMITER => b"HY000",
+            ErrorKind::ER_GET_STACKED_DA_WITHOUT_ACTIVE_HANDLER => b"0Z002",
+            ErrorKind::ER_INVALID_JSON_PATH
+            | ErrorKind::ER_JSON_BAD_ONE_OR_ALL_ARG
+            | ErrorKind::ER_INVALID_JSON_PATH_WILDCARD
+            | ErrorKind::ER_JSON_VACUOUS_PATH
+            | ErrorKind::ER_ILLEGAL_USER_VAR => b"42000",
+            ErrorKind::ER_QUERY_TIMEOUT => b"HY000",
+            ErrorKind::ER_WRONG_COMPRESSION_ALGORITHM_CLIENT
+            | ErrorKind::ER_PART_EXPR_TOO_LONG
+            | ErrorKind::ER_CTE_MAX_RECURSION_DEPTH
+            | ErrorKind::ER_DEPENDENT_BY_PARTITION_FUNC
+            | ErrorKind::ER_CANNOT_CONVERT_STRING
+            | ErrorKind::ER_GENERATED_COLUMN_NAMED_FUNCTION_IS_NOT_ALLOWED => b"HY000",
+            ErrorKind::WARN_AES_KEY_SIZE
+            | ErrorKind::ER_AES_INVALID_KDF_NAME
+            | ErrorKind::ER_AES_INVALID_KDF_ITERATIONS
+            | ErrorKind::ER_AES_INVALID_KDF_OPTION_SIZE => b"HY000",
             ErrorKind::ER_BAD_HOST_ERROR
             | ErrorKind::ER_HANDSHAKE_ERROR
             | ErrorKind::ER_UNKNOWN_COM_ERROR
@@ -2894,6 +3379,7 @@ impl ErrorKind {
             ErrorKind::ER_XAER_RMFAIL => b"XAE07",
             ErrorKind::ER_NO_SUCH_INDEX => b"42S12",
             ErrorKind::ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => b"25006",
+            ErrorKind::ER_NO_SUCH_DB => b"42Y07",
             ErrorKind::ER_SP_BADSELECT
             | ErrorKind::ER_SP_BADSTATEMENT
             | ErrorKind::ER_SP_SUBSELECT_NYI
@@ -2975,6 +3461,7 @@ impl ErrorKind {
             | ErrorKind::ER_NO_PERMISSION_TO_CREATE_USER
             | ErrorKind::ER_USER_LIMIT_REACHED
             | ErrorKind::ER_SPECIFIC_ACCESS_DENIED_ERROR
+            | ErrorKind::ER_PERSIST_ONLY_ACCESS_DENIED_ERROR
             | ErrorKind::ER_NO_DEFAULT
             | ErrorKind::ER_WRONG_VALUE_FOR_VAR
             | ErrorKind::ER_WRONG_TYPE_FOR_VAR
@@ -3096,6 +3583,14 @@ impl ErrorKind {
             | ErrorKind::ER_TABLE_NOT_LOCKED_FOR_WRITE
             | ErrorKind::ER_TABLE_NOT_LOCKED
             | ErrorKind::ER_UNKNOWN_ERROR
+            | ErrorKind::ER_FK_DEPTH_EXCEEDED
+            | ErrorKind::ER_CLIENT_DOES_NOT_SUPPORT
+            | ErrorKind::ER_FK_INCOMPATIBLE_COLUMNS
+            | ErrorKind::ER_CHECK_CONSTRAINT_REFERS_AUTO_INCREMENT_COLUMN
+            | ErrorKind::ER_CHECK_CONSTRAINT_VIOLATED
+            | ErrorKind::ER_JSON_SCHEMA_VALIDATION_ERROR_WITH_DETAILED_REPORT
+            | ErrorKind::ER_UNSUPPORTED_SQL_MODE
+            | ErrorKind::ER_LOCK_NOWAIT
             | ErrorKind::ER_WRONG_PARAMETERS_TO_PROCEDURE
             | ErrorKind::ER_INVALID_GROUP_FUNC_USE
             | ErrorKind::ER_RECORD_FILE_FULL
@@ -3131,6 +3626,7 @@ impl ErrorKind {
             | ErrorKind::ER_FT_MATCHING_KEY_NOT_FOUND
             | ErrorKind::ER_LOCK_OR_ACTIVE_TRANSACTION
             | ErrorKind::ER_UNKNOWN_SYSTEM_VARIABLE
+            | ErrorKind::ER_VAR_DOES_NOT_EXIST
             | ErrorKind::ER_CRASHED_ON_USAGE
             | ErrorKind::ER_CRASHED_ON_REPAIR
             | ErrorKind::ER_WARNING_NOT_COMPLETE_ROLLBACK
@@ -3192,6 +3688,11 @@ impl ErrorKind {
             | ErrorKind::ER_UNKNOWN_KEY_CACHE
             | ErrorKind::ER_WARN_HOSTNAME_WONT_WORK
             | ErrorKind::ER_WARN_DEPRECATED_SYNTAX
+            | ErrorKind::ER_WARN_DEPRECATED_UTF8_ALIAS
+            | ErrorKind::ER_WARN_DEPRECATED_UTF8MB3
+            | ErrorKind::ER_WARN_DEPRECATED_UTF8MB3_COLLATION
+            | ErrorKind::ER_WARN_DEPRECATED_COLLATION
+            | ErrorKind::ER_WARN_DEPRECATED_USER_DEFINED_COLLATIONS
             | ErrorKind::ER_NON_UPDATABLE_TABLE
             | ErrorKind::ER_FEATURE_DISABLED
             | ErrorKind::ER_OPTION_PREVENTS_STATEMENT
@@ -3206,6 +3707,10 @@ impl ErrorKind {
             | ErrorKind::ER_INVALID_CHARACTER_STRING
             | ErrorKind::ER_WARN_ALLOWED_PACKET_OVERFLOWED
             | ErrorKind::ER_CONFLICTING_DECLARATIONS
+            | ErrorKind::ER_TOO_BIG_ENUM
+            | ErrorKind::ER_TOO_LONG_SET_ENUM_VALUE
+            | ErrorKind::ER_SCHEMA_READ_ONLY
+            | ErrorKind::ER_NO_SYSTEM_SCHEMA_ACCESS
             | ErrorKind::ER_SP_DROP_FAILED
             | ErrorKind::ER_SP_STORE_FAILED
             | ErrorKind::ER_SP_WRONG_NO_OF_FETCH_ARGS
@@ -3523,6 +4028,7 @@ impl ErrorKind {
             | ErrorKind::ER_FAILED_READ_FROM_PAR_FILE
             | ErrorKind::ER_VALUES_IS_NOT_INT_TYPE_ERROR
             | ErrorKind::ER_SET_PASSWORD_AUTH_PLUGIN
+            | ErrorKind::ER_SET_PASSWORD_AUTH_PLUGIN_ERROR
             | ErrorKind::ER_GRANT_PLUGIN_USER_EXISTS
             | ErrorKind::ER_PLUGIN_IS_PERMANENT
             | ErrorKind::ER_SLAVE_HEARTBEAT_VALUE_OUT_OF_RANGE_MIN
@@ -3653,6 +4159,7 @@ impl ErrorKind {
             | ErrorKind::ER_FK_COLUMN_CANNOT_CHANGE
             | ErrorKind::ER_FK_COLUMN_CANNOT_CHANGE_CHILD
             | ErrorKind::ER_FK_CANNOT_DELETE_PARENT
+            | ErrorKind::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN
             | ErrorKind::ER_MALFORMED_PACKET
             | ErrorKind::ER_READ_ONLY_MODE
             | ErrorKind::ER_GTID_NEXT_TYPE_UNDEFINED_GROUP
@@ -3700,6 +4207,24 @@ impl ErrorKind {
             | ErrorKind::ER_PLUGIN_CANNOT_BE_UNINSTALLED
             | ErrorKind::ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP
             | ErrorKind::ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER => b"HY000",
+            ErrorKind::ER_UNRESOLVED_HINT_NAME => b"HY000",
+            ErrorKind::ER_INVALID_ARGUMENT_FOR_LOGARITHM => b"2201E",
+            ErrorKind::ER_INVALID_USER_ATTRIBUTE_JSON => b"HY000",
+            ErrorKind::ER_USER_DOES_NOT_EXIST | ErrorKind::ER_USER_ALREADY_EXISTS => b"HY000",
+            ErrorKind::ER_UNSUPPORTED_USE_OF_GRANT_AS
+            | ErrorKind::ER_UKNOWN_AUTH_ID_OR_ACCESS_DENIED_FOR_GRANT_AS
+            | ErrorKind::ER_PARTIAL_REVOKES_EXIST
+            | ErrorKind::ER_FK_CANNOT_DROP_PARENT => b"HY000",
+            ErrorKind::ER_CREDENTIALS_CONTRADICT_TO_HISTORY
+            | ErrorKind::ER_WARNING_PASSWORD_HISTORY_CLAUSES_VOID
+            | ErrorKind::ER_WARNING_RETAIN_CURRENT_PASSWORD_CLAUSE_VOID
+            | ErrorKind::ER_WARNING_DISCARD_OLD_PASSWORD_CLAUSE_VOID
+            | ErrorKind::ER_INCORRECT_CURRENT_PASSWORD
+            | ErrorKind::ER_MISSING_CURRENT_PASSWORD
+            | ErrorKind::ER_CURRENT_PASSWORD_NOT_REQUIRED => b"HY000",
+            ErrorKind::ER_XA_TEMP_TABLE => b"HY000",
+            ErrorKind::ER_REFERENCED_TRG_DOES_NOT_EXIST
+            | ErrorKind::ER_IF_NOT_EXISTS_UNSUPPORTED_TRG_EXISTS_ON_DIFFERENT_TABLE => b"HY000",
             ErrorKind::ER_XAER_NOTA => b"XAE04",
             ErrorKind::ER_XA_RBROLLBACK => b"XA100",
             ErrorKind::ER_DATA_TOO_LONG => b"22001",

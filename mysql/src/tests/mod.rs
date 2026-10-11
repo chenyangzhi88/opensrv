@@ -12,7 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod auth;
+mod auth_errorcodes;
 mod commands;
+mod errorcodes;
+mod lib;
+mod local_infile;
 mod packet;
+pub(crate) use crate::packet_reader::tests as packet_reader;
+mod packet_writer;
+mod params;
+mod resultset;
+mod srs_geometry_errorcodes;
 mod value;
 mod writers;

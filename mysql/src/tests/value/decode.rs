@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use crate::myc;
-use crate::value::Value;
-use crate::{Column, ColumnFlags, ColumnType};
+use crate::{Column, ColumnFlags, ColumnType, ParamParser, StatementData};
 use chrono::{self, TimeZone};
 use myc::proto::MySerialize;
 use std::time;
@@ -28,11 +27,16 @@ macro_rules! rt {
         fn $name() {
             let mut data = Vec::new();
             let mut col = Column {
-                table: String::new(),
-                column: String::new(),
+                database: Vec::new(),
+                org_table: Vec::new(),
+                org_column: Vec::new(),
+                table: Vec::new(),
+                column: Vec::new(),
                 collen: 0,
+                charset: None,
                 coltype: $ct,
                 colflags: ColumnFlags::empty(),
+                decimals: None,
             };
 
             if !$sig {
@@ -41,10 +45,16 @@ macro_rules! rt {
 
             let v: $t = $v;
             myc::value::Value::from(v).serialize(&mut data);
-            assert_eq!(
-                Into::<$t>::into(Value::parse_from(&mut &data[..], $ct, !$sig).unwrap()),
-                v
-            );
+            let mut packet = vec![0, 1, $ct as u8, u8::from(!$sig) << 7];
+            packet.extend_from_slice(&data);
+            let mut statement = StatementData {
+                params: 1,
+                ..StatementData::default()
+            };
+            let mut values = ParamParser::execute(&packet, &mut statement, false, 0, None)
+                .parse()
+                .unwrap();
+            assert_eq!(Into::<$t>::into(values.pop().unwrap().value), v);
         }
     };
 }

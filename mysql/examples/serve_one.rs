@@ -32,7 +32,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
     async fn on_prepare<'a>(
         &'a mut self,
-        _: &'a str,
+        _: &'a [u8],
         info: StatementMetaWriter<'a, W>,
     ) -> io::Result<()> {
         info.reply(42, &[], &[]).await
@@ -51,7 +51,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
     async fn on_query<'a>(
         &'a mut self,
-        sql: &'a str,
+        sql: &'a [u8],
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
         println!("execute sql {sql:?}");

@@ -31,7 +31,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
     async fn on_prepare<'a>(
         &'a mut self,
-        _: &'a str,
+        _: &'a [u8],
         info: StatementMetaWriter<'a, W>,
     ) -> io::Result<()> {
         info.reply(42, &[], &[]).await
@@ -50,7 +50,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
     async fn on_query<'a>(
         &'a mut self,
-        sql: &'a str,
+        sql: &'a [u8],
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
         println!("execute sql {:?}", sql);
@@ -85,6 +85,30 @@ Submit [issues](https://github.com/datafuselabs/opensrv/issues/new/choose) for b
 ## Credits
 
 This project is a branch of [jonhoo/msql-srv](https://github.com/jonhoo/msql-srv) and focuses on providing asynchronous support.
+
+## Classic query bindings
+
+The legacy backend parameter API is fallible: use `ParamParser::parse()?`,
+not an iterator over untrusted packets. `Params` and the unchecked
+`IntoIterator` implementation have been removed.
+
+Query attributes are **off by default**, including when a backend adds the
+capability manually without installing `query_attributes_admission()`.
+An opting-in shim must implement `on_query_bindings` and
+`on_execute_bindings` and issue a real, retained allocation permit. The
+default callbacks reject the new envelope rather than discard attributes.
+`ParsedBindings` exposes ordered raw slots and the SQL suffix; names/types
+are interleaved in the wire packet. `bind_placeholders()` returns the first
+actual statement parameter count with its own retained allocation permit.
+Attribute names and values are never cached in prepared statement state.
+
+`Packet::owned_range()` shares the actual Bytes allocation, including while
+the reader polls the next command. Dispatch-issued envelopes also expose
+`packet_owner()` and checked `packet_range()` for zero-copy downstream
+command retention (placeholder long data has its own StatementData owner).
+This does not claim admission coverage for
+the pre-existing receive/decompression buffers. It does not install
+`mysql_query_attribute_string` or a component ABI.
 
 ## License
 

@@ -17,7 +17,6 @@ use std::io;
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::myc::constants::ColumnType;
-use crate::myc::io::ReadMysqlExt;
 
 /// MySQL value as provided when executing prepared statements.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -34,7 +33,9 @@ pub enum ValueInner<'a> {
     Int(i64),
     /// An unsigned integer.
     UInt(u64),
-    /// A floating point number.
+    /// A four-byte floating point parameter, before backend Item promotion.
+    Float(f32),
+    /// An eight-byte floating point parameter.
     Double(f64),
     /// A [binary encoding](https://mariadb.com/kb/en/library/resultset-row/#date-binary-encoding)
     /// of a `MYSQL_TYPE_DATE`.
@@ -68,115 +69,101 @@ impl<'a> Value<'a> {
         matches!(self.0, ValueInner::NULL)
     }
 
-    pub(crate) fn parse_from(
-        input: &mut &'a [u8],
-        ct: ColumnType,
-        unsigned: bool,
-    ) -> io::Result<Self> {
-        ValueInner::parse_from(input, ct, unsigned).map(Value)
-    }
-
     pub(crate) fn bytes(input: &'a [u8]) -> Value<'a> {
         Value(ValueInner::Bytes(input))
     }
-}
 
-macro_rules! read_bytes {
-    ($input:expr, $len:expr) => {
-        if $len as usize > $input.len() {
-            Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "EOF while reading length-encoded string",
-            ))
-        } else {
-            let (bits, rest) = $input.split_at($len as usize);
-            *$input = rest;
-            Ok(bits)
-        }
-    };
-}
-
-impl<'a> ValueInner<'a> {
-    fn parse_from(input: &mut &'a [u8], ct: ColumnType, unsigned: bool) -> io::Result<Self> {
-        match ct {
-            ColumnType::MYSQL_TYPE_STRING
-            | ColumnType::MYSQL_TYPE_VAR_STRING
-            | ColumnType::MYSQL_TYPE_BLOB
-            | ColumnType::MYSQL_TYPE_TINY_BLOB
-            | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
-            | ColumnType::MYSQL_TYPE_LONG_BLOB
-            | ColumnType::MYSQL_TYPE_SET
-            | ColumnType::MYSQL_TYPE_ENUM
-            | ColumnType::MYSQL_TYPE_DECIMAL
-            | ColumnType::MYSQL_TYPE_VARCHAR
-            | ColumnType::MYSQL_TYPE_BIT
-            | ColumnType::MYSQL_TYPE_NEWDECIMAL
-            | ColumnType::MYSQL_TYPE_GEOMETRY
-            | ColumnType::MYSQL_TYPE_JSON => {
-                let len = input.read_lenenc_int()?;
-                Ok(ValueInner::Bytes(read_bytes!(input, len)?))
-            }
+    /// Converts an already framed placeholder payload, without rebuilding a
+    /// length prefix or reparsing a rendered value. Framing belongs to params.
+    pub(crate) fn from_parameter_payload(
+        mut input: &'a [u8],
+        ct: ColumnType,
+        unsigned: bool,
+    ) -> io::Result<Self> {
+        let wrong_length = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid parameter payload length",
+            )
+        };
+        let value = match ct {
             ColumnType::MYSQL_TYPE_TINY => {
+                if input.len() != 1 {
+                    return Err(wrong_length());
+                }
                 if unsigned {
-                    Ok(ValueInner::UInt(u64::from(input.read_u8()?)))
+                    ValueInner::UInt(u64::from(input.read_u8()?))
                 } else {
-                    Ok(ValueInner::Int(i64::from(input.read_i8()?)))
+                    ValueInner::Int(i64::from(input.read_i8()?))
                 }
             }
-            ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => {
+            ColumnType::MYSQL_TYPE_SHORT => {
+                if input.len() != 2 {
+                    return Err(wrong_length());
+                }
                 if unsigned {
-                    Ok(ValueInner::UInt(u64::from(
-                        input.read_u16::<LittleEndian>()?,
-                    )))
+                    ValueInner::UInt(u64::from(input.read_u16::<LittleEndian>()?))
                 } else {
-                    Ok(ValueInner::Int(i64::from(
-                        input.read_i16::<LittleEndian>()?,
-                    )))
+                    ValueInner::Int(i64::from(input.read_i16::<LittleEndian>()?))
                 }
             }
             ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => {
+                if input.len() != 4 {
+                    return Err(wrong_length());
+                }
                 if unsigned {
-                    Ok(ValueInner::UInt(u64::from(
-                        input.read_u32::<LittleEndian>()?,
-                    )))
+                    ValueInner::UInt(u64::from(input.read_u32::<LittleEndian>()?))
                 } else {
-                    Ok(ValueInner::Int(i64::from(
-                        input.read_i32::<LittleEndian>()?,
-                    )))
+                    ValueInner::Int(i64::from(input.read_i32::<LittleEndian>()?))
                 }
             }
             ColumnType::MYSQL_TYPE_LONGLONG => {
+                if input.len() != 8 {
+                    return Err(wrong_length());
+                }
                 if unsigned {
-                    Ok(ValueInner::UInt(input.read_u64::<LittleEndian>()?))
+                    ValueInner::UInt(input.read_u64::<LittleEndian>()?)
                 } else {
-                    Ok(ValueInner::Int(input.read_i64::<LittleEndian>()?))
+                    ValueInner::Int(input.read_i64::<LittleEndian>()?)
                 }
             }
             ColumnType::MYSQL_TYPE_FLOAT => {
-                let f = input.read_f32::<LittleEndian>()?;
-                Ok(ValueInner::Double(f64::from(f)))
+                if input.len() != 4 {
+                    return Err(wrong_length());
+                }
+                ValueInner::Float(input.read_f32::<LittleEndian>()?)
             }
             ColumnType::MYSQL_TYPE_DOUBLE => {
-                Ok(ValueInner::Double(input.read_f64::<LittleEndian>()?))
-            }
-            ColumnType::MYSQL_TYPE_TIMESTAMP | ColumnType::MYSQL_TYPE_DATETIME => {
-                let len = input.read_u8()?;
-                Ok(ValueInner::Datetime(read_bytes!(input, len)?))
+                if input.len() != 8 {
+                    return Err(wrong_length());
+                }
+                ValueInner::Double(input.read_f64::<LittleEndian>()?)
             }
             ColumnType::MYSQL_TYPE_DATE => {
-                let len = input.read_u8()?;
-                Ok(ValueInner::Date(read_bytes!(input, len)?))
+                ValueInner::Date(if input.len() < 4 { &[] } else { &input[..4] })
             }
             ColumnType::MYSQL_TYPE_TIME => {
-                let len = input.read_u8()?;
-                Ok(ValueInner::Time(read_bytes!(input, len)?))
+                if (9..12).contains(&input.len()) {
+                    return Err(wrong_length());
+                }
+                ValueInner::Time(if input.len() < 8 {
+                    &[]
+                } else if input.len() == 8 {
+                    input
+                } else {
+                    &input[..12]
+                })
             }
-            ColumnType::MYSQL_TYPE_NULL => Ok(ValueInner::NULL),
-            ct => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unknown column type {ct:?}"),
-            )),
-        }
+            ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+                if !matches!(input.len(), 0 | 4 | 7 | 11 | 13) {
+                    return Err(wrong_length());
+                }
+                ValueInner::Datetime(input)
+            }
+            ColumnType::MYSQL_TYPE_NULL => ValueInner::NULL,
+            _ => ValueInner::Bytes(input),
+        };
+        Ok(Value(value))
     }
 }
 
@@ -202,8 +189,8 @@ impl_into!(i8, ValueInner::UInt, ValueInner::Int);
 impl_into!(i16, ValueInner::UInt, ValueInner::Int);
 impl_into!(i32, ValueInner::UInt, ValueInner::Int);
 impl_into!(i64, ValueInner::Int);
-impl_into!(f32, ValueInner::Double);
-impl_into!(f64, ValueInner::Double);
+impl_into!(f32, ValueInner::Float, ValueInner::Double);
+impl_into!(f64, ValueInner::Float, ValueInner::Double);
 impl_into!(&'a [u8], ValueInner::Bytes);
 
 impl<'a> From<Value<'a>> for &'a str {
@@ -274,7 +261,7 @@ pub fn to_naive_datetime(val: Value) -> Result<NaiveDateTime, io::Error> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "'0000-00-00 00:00:00' is a valid timestamp value but not representable by NaiveDateTime!",
-            ))
+            ));
         }
         4 => {
             let (y, m, d) = read_ymd(v);
@@ -302,7 +289,7 @@ pub fn to_naive_datetime(val: Value) -> Result<NaiveDateTime, io::Error> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("illegal timestamp value length: {len}"),
-            ))
+            ));
         }
     };
 

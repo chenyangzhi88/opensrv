@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use byteorder::{ByteOrder, LittleEndian};
+use flate2::{Compression, write::ZlibEncoder};
 use std::io;
-use std::io::prelude::*;
 use std::io::IoSlice;
+use std::io::prelude::*;
 
 use crate::U24_MAX;
+use crate::packet_reader::CompressionAlgorithm;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// The writer of mysql packet.
@@ -27,11 +29,29 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub struct PacketWriter<W> {
     packet_builder: PacketBuilder,
     output_stream: W,
+    compression: CompressionAlgorithm,
+    zstd_level: i32,
+    compressed_seq: u8,
+    network_settings: Option<crate::NetworkSettings>,
 }
 
 // exports the internal builder as sync Write
 impl<W> Write for PacketWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Packet construction consists of many small scalar writes. Reserve
+        // its actual initial NET buffer once, not once per encoded field.
+        // Transport write/flush still read current timeouts at each real I/O.
+        if self.packet_builder.is_empty() {
+            if let Some(read) = &self.network_settings {
+                let minimum = read()?.buffer_length;
+                if self.packet_builder.buffer.capacity() < minimum {
+                    self.packet_builder
+                        .buffer
+                        .try_reserve(minimum.saturating_sub(self.packet_builder.buffer.len()))
+                        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+                }
+            }
+        }
         self.packet_builder.write(buf)
     }
 
@@ -45,50 +65,130 @@ impl<W> PacketWriter<W> {
         Self {
             packet_builder: PacketBuilder::new(),
             output_stream,
+            compression: CompressionAlgorithm::None,
+            zstd_level: 3,
+            compressed_seq: 0,
+            network_settings: None,
         }
     }
+    pub(crate) fn set_network_settings(&mut self, settings: Option<crate::NetworkSettings>) {
+        self.network_settings = settings;
+    }
     pub fn set_seq(&mut self, seq: u8) {
-        self.packet_builder.set_seq(seq)
+        self.packet_builder.set_seq(seq);
+    }
+
+    pub(crate) fn sequence(&self) -> u8 {
+        self.packet_builder.seq()
+    }
+
+    pub(crate) fn compressed_sequence(&self) -> u8 {
+        self.compressed_seq
+    }
+
+    pub(crate) fn set_compressed_sequence(&mut self, seq: u8) {
+        if self.compression != CompressionAlgorithm::None {
+            self.compressed_seq = seq;
+        }
+    }
+
+    pub fn enable_compression(&mut self) {
+        self.compression = CompressionAlgorithm::Zlib;
+        self.compressed_seq = 0;
+    }
+
+    pub fn enable_zstd_compression(&mut self, level: u8) {
+        self.compression = CompressionAlgorithm::Zstd;
+        self.zstd_level = i32::from(level);
+        self.compressed_seq = 0;
     }
 }
 
 const PACKET_HEADER_SIZE: usize = 4;
 impl<W: AsyncWrite + Unpin> PacketWriter<W> {
+    async fn write_network(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        let mut retries = 0;
+        while !bytes.is_empty() {
+            let settings = self
+                .network_settings
+                .as_ref()
+                .map(|read| read())
+                .transpose()?;
+            let slices = [IoSlice::new(bytes)];
+            let write = self.output_stream.write_vectored(&slices);
+            let result = match settings {
+                Some(settings) => tokio::time::timeout(settings.write_timeout, write)
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "MySQL NET write timeout")
+                    })?,
+                None => write.await,
+            };
+            match result {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "MySQL NET write returned zero",
+                    ));
+                }
+                Ok(written) => {
+                    bytes = &bytes[written..];
+                    retries = 0;
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::Interrupted
+                        && retries < settings.map_or(0, |value| value.retry_count) =>
+                {
+                    retries += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
     /// Build packet(s) and write them to the output stream
     pub async fn end_packet(&mut self) -> io::Result<()> {
         let builder = &mut self.packet_builder;
         if !builder.is_empty() {
             let raw_packet = builder.take_buffer();
 
-            // split the rww buffer at the boundary of size U24_MAX
-            let chunks = raw_packet.chunks(U24_MAX);
-            let mut header = [0; PACKET_HEADER_SIZE];
-            for chunk in chunks {
-                // prepare the header
-                LittleEndian::write_u24(&mut header, chunk.len() as u32);
-                header[3] = builder.seq();
-                builder.increase_seq();
-
-                // write out the header and payload.
-                //
-                // depends on the AsyncWrite provided, this may trigger
-                // real system call or not (for example, if AsyncWrite is buffered stream)
-                let written = self
-                    .output_stream
-                    .write_vectored(&[IoSlice::new(&header), IoSlice::new(chunk)])
-                    .await?;
-
-                // if write buffer is not drained, fall back to write_all
-                if written != PACKET_HEADER_SIZE + chunk.len() {
-                    let remaining: Vec<u8> = header
-                        .iter()
-                        .chain(chunk.iter())
-                        .skip(written)
-                        .cloned()
-                        .collect();
-                    self.output_stream.write_all(&remaining).await?
+            if self.compression != CompressionAlgorithm::None {
+                // Compression wraps the classic packet byte stream. Build the classic stream
+                // first so payloads over 0xFFFFFF bytes retain their continuation headers (and
+                // the required zero-length terminator at an exact boundary).
+                let mut plain = Vec::with_capacity(raw_packet.len() + 8);
+                append_classic_packets(&mut plain, &raw_packet, builder);
+                for chunk in plain.chunks(U24_MAX) {
+                    let compressed = match self.compression {
+                        CompressionAlgorithm::Zlib => {
+                            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                            encoder.write_all(chunk)?;
+                            encoder.finish()?
+                        }
+                        CompressionAlgorithm::Zstd => {
+                            zstd::stream::encode_all(chunk, self.zstd_level)?
+                        }
+                        CompressionAlgorithm::None => unreachable!(),
+                    };
+                    let (payload, uncompressed_len) = if compressed.len() < chunk.len() {
+                        (compressed.as_slice(), chunk.len())
+                    } else {
+                        (chunk, 0)
+                    };
+                    let mut header = [0u8; 7];
+                    LittleEndian::write_u24(&mut header[..3], payload.len() as u32);
+                    header[3] = self.compressed_seq;
+                    LittleEndian::write_u24(&mut header[4..], uncompressed_len as u32);
+                    self.compressed_seq = self.compressed_seq.wrapping_add(1);
+                    self.write_network(&header).await?;
+                    self.write_network(payload).await?;
                 }
+                return Ok(());
             }
+
+            let mut plain = Vec::with_capacity(raw_packet.len() + 8);
+            append_classic_packets(&mut plain, &raw_packet, builder);
+            self.write_network(&plain).await?;
             Ok(())
         } else {
             Ok(())
@@ -96,7 +196,47 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     }
 
     pub async fn flush_all(&mut self) -> io::Result<()> {
-        self.output_stream.flush().await
+        let mut retries = 0;
+        loop {
+            let settings = self
+                .network_settings
+                .as_ref()
+                .map(|read| read())
+                .transpose()?;
+            let flush = self.output_stream.flush();
+            let result = match settings {
+                Some(settings) => tokio::time::timeout(settings.write_timeout, flush)
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "MySQL NET write timeout")
+                    })?,
+                None => flush.await,
+            };
+            match result {
+                Err(error)
+                    if error.kind() == io::ErrorKind::Interrupted
+                        && retries < settings.map_or(0, |value| value.retry_count) =>
+                {
+                    retries += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+fn append_classic_packets(output: &mut Vec<u8>, payload: &[u8], builder: &mut PacketBuilder) {
+    for chunk in payload.chunks(U24_MAX) {
+        let mut header = [0; PACKET_HEADER_SIZE];
+        LittleEndian::write_u24(&mut header, chunk.len() as u32);
+        header[3] = builder.seq();
+        builder.increase_seq();
+        output.extend_from_slice(&header);
+        output.extend_from_slice(chunk);
+    }
+    if payload.len() % U24_MAX == 0 {
+        output.extend_from_slice(&[0, 0, 0, builder.seq()]);
+        builder.increase_seq();
     }
 }
 

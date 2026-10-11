@@ -16,24 +16,41 @@ use std::io;
 use std::io::prelude::*;
 
 use std::iter::Enumerate;
-use std::marker::PhantomData;
 use std::ops::RangeFrom;
 
 use bytes::BytesMut;
+use flate2::read::ZlibDecoder;
 use nom::Needed;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
-const PACKET_BUFFER_SIZE: usize = 4_096;
-const PACKET_LARGE_BUFFER_SIZE: usize = 1_048_576;
+#[cfg(test)]
+#[path = "tests/packet_reader.rs"]
+pub(crate) mod tests;
+
+pub(crate) const PACKET_BUFFER_SIZE: usize = 4_096;
+pub(crate) const PACKET_LARGE_BUFFER_SIZE: usize = 1_048_576;
+pub(crate) const DEFAULT_MAX_ALLOWED_PACKET: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CompressionAlgorithm {
+    #[default]
+    None,
+    Zlib,
+    Zstd,
+}
 
 /// Calculate the new buffer size for the next read
 fn calc_new_buf_size(last_buf_size: usize) -> usize {
-    if last_buf_size >= PACKET_BUFFER_SIZE * 2 {
+    calc_new_buf_size_with_minimum(last_buf_size, PACKET_BUFFER_SIZE)
+}
+
+fn calc_new_buf_size_with_minimum(last_buf_size: usize, minimum: usize) -> usize {
+    if last_buf_size >= minimum * 2 {
         // if packet is already too large, use larger buffer to avoid multiple allocation
         PACKET_LARGE_BUFFER_SIZE
     } else {
-        std::cmp::max(PACKET_BUFFER_SIZE, last_buf_size * 2)
+        std::cmp::max(minimum, last_buf_size * 2)
     }
 }
 
@@ -43,7 +60,15 @@ fn calc_new_buf_size(last_buf_size: usize) -> usize {
 ///
 /// will copy the remain bytes from the old buffer to the new buffer if reusing
 fn reuse_or_create_buf(old_buf: bytes::Bytes, last_buf_size: usize) -> (usize, BytesMut) {
-    let new_buf_size = calc_new_buf_size(last_buf_size);
+    reuse_or_create_buf_with_minimum(old_buf, last_buf_size, PACKET_BUFFER_SIZE)
+}
+
+fn reuse_or_create_buf_with_minimum(
+    old_buf: bytes::Bytes,
+    last_buf_size: usize,
+    minimum: usize,
+) -> (usize, BytesMut) {
+    let new_buf_size = calc_new_buf_size_with_minimum(last_buf_size, minimum);
     match old_buf.try_into_mut() {
         Ok(mut unique) => {
             let len = unique.len();
@@ -68,9 +93,51 @@ fn reuse_or_create_buf(old_buf: bytes::Bytes, last_buf_size: usize) -> (usize, B
     }
 }
 
+// A pending read may be dropped by the response/peer select. The bytes already
+// read still belong to this reader, not to that cancellable future. Restore the
+// same allocation on both completion and cancellation without copying prefix.
+struct ReadBufferGuard<'a> {
+    owner: &'a mut bytes::Bytes,
+    buffer: BytesMut,
+    initialized: usize,
+}
+
+impl<'a> ReadBufferGuard<'a> {
+    fn new(owner: &'a mut bytes::Bytes, last_size: usize, minimum: usize) -> Self {
+        let (initialized, buffer) =
+            reuse_or_create_buf_with_minimum(std::mem::take(owner), last_size, minimum);
+        Self {
+            owner,
+            buffer,
+            initialized,
+        }
+    }
+
+    fn remaining(&mut self) -> &mut [u8] {
+        &mut self.buffer[self.initialized..]
+    }
+
+    fn complete(&mut self, count: usize) {
+        self.initialized += count;
+    }
+}
+
+impl Drop for ReadBufferGuard<'_> {
+    fn drop(&mut self) {
+        self.buffer.truncate(self.initialized);
+        *self.owner = std::mem::take(&mut self.buffer).freeze();
+    }
+}
+
 pub struct PacketReader<R> {
     bytes: bytes::Bytes,
     pub r: R,
+    compression: CompressionAlgorithm,
+    compressed_bytes: bytes::Bytes,
+    compressed_seq: u8,
+    new_command_in_progress: bool,
+    max_allowed_packet: usize,
+    network_settings: Option<crate::NetworkSettings>,
 }
 
 impl<R> PacketReader<R> {
@@ -78,28 +145,129 @@ impl<R> PacketReader<R> {
         PacketReader {
             bytes: bytes::Bytes::new(),
             r,
+            compression: CompressionAlgorithm::None,
+            compressed_bytes: bytes::Bytes::new(),
+            compressed_seq: 0,
+            new_command_in_progress: false,
+            max_allowed_packet: DEFAULT_MAX_ALLOWED_PACKET,
+            network_settings: None,
         }
+    }
+
+    pub(crate) fn set_max_allowed_packet(&mut self, max_allowed_packet: usize) {
+        self.max_allowed_packet = max_allowed_packet;
+    }
+
+    pub(crate) fn set_network_settings(&mut self, settings: Option<crate::NetworkSettings>) {
+        self.network_settings = settings;
+    }
+
+    fn network_buffer_length(&self) -> io::Result<usize> {
+        self.network_settings
+            .as_ref()
+            .map_or(Ok(PACKET_BUFFER_SIZE), |read| {
+                read().map(|value| value.buffer_length)
+            })
+    }
+
+    pub fn enable_compression(&mut self) {
+        self.enable_compression_algorithm(CompressionAlgorithm::Zlib);
+    }
+
+    pub fn enable_zstd_compression(&mut self) {
+        self.enable_compression_algorithm(CompressionAlgorithm::Zstd);
+    }
+
+    fn enable_compression_algorithm(&mut self, compression: CompressionAlgorithm) {
+        self.compression = compression;
+        self.bytes = bytes::Bytes::new();
+        self.compressed_bytes = bytes::Bytes::new();
+        self.compressed_seq = 0;
+        self.new_command_in_progress = false;
+    }
+
+    pub(crate) fn reset_compressed_sequence(&mut self) {
+        if self.compression != CompressionAlgorithm::None {
+            self.compressed_seq = 0;
+        }
+    }
+
+    pub(crate) fn compressed_sequence(&self) -> u8 {
+        self.compressed_seq
+    }
+
+    pub(crate) fn set_compressed_sequence(&mut self, sequence: u8) {
+        if self.compression != CompressionAlgorithm::None {
+            self.compressed_seq = sequence;
+        }
+    }
+
+    /// Push an already decoded command back in front of unread bytes. This is used when a
+    /// pipelining client sends its next command immediately after receiving the final response
+    /// packet while the query future is completing bookkeeping.
+    pub(crate) fn prepend_packet(&mut self, last_seq: u8, payload: &[u8]) {
+        let mut encoded = BytesMut::with_capacity(
+            payload
+                .len()
+                .saturating_add(8)
+                .saturating_add(self.bytes.len()),
+        );
+        let mut offset = 0usize;
+        // packet() returns the final physical sequence, which the response
+        // writer needs. Reconstruct this same packet's first sequence rather
+        // than assigning that final sequence to every deferred continuation.
+        let mut seq = first_sequence(last_seq, payload.len());
+        loop {
+            let remaining = payload.len().saturating_sub(offset);
+            let chunk_len = remaining.min(crate::U24_MAX);
+            encoded.extend_from_slice(&[
+                (chunk_len & 0xff) as u8,
+                ((chunk_len >> 8) & 0xff) as u8,
+                ((chunk_len >> 16) & 0xff) as u8,
+                seq,
+            ]);
+            encoded.extend_from_slice(&payload[offset..offset + chunk_len]);
+            offset += chunk_len;
+            seq = seq.wrapping_add(1);
+            if chunk_len < crate::U24_MAX {
+                break;
+            }
+            if offset == payload.len() {
+                encoded.extend_from_slice(&[0, 0, 0, seq]);
+                break;
+            }
+        }
+        encoded.extend_from_slice(&self.bytes);
+        self.bytes = encoded.freeze();
     }
 }
 
 impl<R: Read> PacketReader<R> {
     #[allow(dead_code)]
-    pub fn next(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
+    pub fn next(&mut self) -> io::Result<Option<(u8, Packet)>> {
         loop {
             let last_buffer_size = self.bytes.len();
+            // Check the declared logical length before the continuation parser
+            // allocates its joined payload, even when all bytes are buffered.
+            if encoded_packet_exceeds_limit(&self.bytes, self.max_allowed_packet) {
+                return Err(packet_too_large());
+            }
             if !self.bytes.is_empty() {
                 // coping `bytes::Bytes` are very cheap, just move the pointer and increase the ref count.
                 match packet(self.bytes.clone().into()) {
                     Ok((rest, p)) => {
+                        if p.1.len() > self.max_allowed_packet {
+                            return Err(packet_too_large());
+                        }
                         // most time the `rest` is either empty or very small, so it's cheap to copy it later into next buffer
                         self.bytes = rest.into();
                         return Ok(Some(p));
                     }
                     Err(nom::Err::Incomplete(_)) | Err(nom::Err::Error(_)) => {}
-                    Err(nom::Err::Failure(ctx)) => {
+                    Err(nom::Err::Failure(_)) => {
                         let err = Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("{ctx:?}"),
+                            "malformed MySQL packet framing",
                         ));
                         return err;
                     }
@@ -146,33 +314,253 @@ impl<R: AsyncRead + Unpin> AsyncRead for PacketReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> PacketReader<R> {
-    pub async fn next_async(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
+    async fn read_network(
+        reader: &mut R,
+        network_settings: Option<&crate::NetworkSettings>,
+        buffer: &mut [u8],
+        partial: bool,
+        idle: Option<std::time::Duration>,
+    ) -> io::Result<usize> {
+        let mut retries = 0;
+        loop {
+            let settings = network_settings.map(|read| read()).transpose()?;
+            let timeout = if partial {
+                settings.map(|value| value.read_timeout)
+            } else {
+                idle
+            };
+            let read = reader.read(buffer);
+            let result = match timeout {
+                Some(timeout) => tokio::time::timeout(timeout, read).await.map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        if partial {
+                            "MySQL NET read timeout"
+                        } else {
+                            "MySQL connection idle timeout"
+                        },
+                    )
+                })?,
+                None => read.await,
+            };
+            match result {
+                Err(error)
+                    if error.kind() == io::ErrorKind::Interrupted
+                        && retries < settings.map_or(0, |value| value.retry_count) =>
+                {
+                    retries += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn read_compressed_frame(
+        &mut self,
+        idle: Option<std::time::Duration>,
+    ) -> io::Result<bool> {
+        while self.compressed_bytes.len() < 7 {
+            let mut buffer = vec![0u8; self.network_buffer_length()?];
+            let partial = !self.compressed_bytes.is_empty() || !self.bytes.is_empty();
+            let read = Self::read_network(
+                &mut self.r,
+                self.network_settings.as_ref(),
+                &mut buffer,
+                partial,
+                idle,
+            )
+            .await?;
+            if read == 0 {
+                return if self.compressed_bytes.is_empty() {
+                    Ok(false)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated compressed MySQL packet header",
+                    ))
+                };
+            }
+            buffer.truncate(read);
+            let mut combined = BytesMut::with_capacity(self.compressed_bytes.len() + read);
+            combined.extend_from_slice(&self.compressed_bytes);
+            combined.extend_from_slice(&buffer);
+            self.compressed_bytes = combined.freeze();
+        }
+        let compressed_len = (self.compressed_bytes[0] as usize)
+            | ((self.compressed_bytes[1] as usize) << 8)
+            | ((self.compressed_bytes[2] as usize) << 16);
+        let uncompressed_len = (self.compressed_bytes[4] as usize)
+            | ((self.compressed_bytes[5] as usize) << 8)
+            | ((self.compressed_bytes[6] as usize) << 16);
+        let sequence = self.compressed_bytes[3];
+        if sequence != self.compressed_seq {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compressed MySQL packet out of order: received {sequence}, expected {}",
+                    self.compressed_seq
+                ),
+            ));
+        }
+        if compressed_len > self.max_allowed_packet || uncompressed_len > self.max_allowed_packet {
+            return Err(compressed_packet_too_large());
+        }
+        while self.compressed_bytes.len() < 7 + compressed_len {
+            let mut buffer = vec![
+                0u8;
+                (7 + compressed_len - self.compressed_bytes.len())
+                    .max(self.network_buffer_length()?)
+            ];
+            let read = Self::read_network(
+                &mut self.r,
+                self.network_settings.as_ref(),
+                &mut buffer,
+                true,
+                None,
+            )
+            .await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated compressed MySQL packet",
+                ));
+            }
+            buffer.truncate(read);
+            let mut combined = BytesMut::with_capacity(self.compressed_bytes.len() + read);
+            combined.extend_from_slice(&self.compressed_bytes);
+            combined.extend_from_slice(&buffer);
+            self.compressed_bytes = combined.freeze();
+        }
+        let payload = self.compressed_bytes.slice(7..7 + compressed_len);
+        self.compressed_bytes = self.compressed_bytes.slice(7 + compressed_len..);
+        let decoded = if uncompressed_len == 0 {
+            payload.to_vec()
+        } else {
+            let mut decoded = Vec::with_capacity(uncompressed_len);
+            match self.compression {
+                CompressionAlgorithm::Zlib => {
+                    ZlibDecoder::new(payload.as_ref())
+                        .take(uncompressed_len as u64 + 1)
+                        .read_to_end(&mut decoded)?;
+                }
+                CompressionAlgorithm::Zstd => {
+                    zstd::stream::Decoder::new(payload.as_ref())?
+                        .take(uncompressed_len as u64 + 1)
+                        .read_to_end(&mut decoded)?;
+                }
+                CompressionAlgorithm::None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "received a compressed frame without negotiated compression",
+                    ));
+                }
+            }
+            if decoded.len() != uncompressed_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed MySQL packet length mismatch",
+                ));
+            }
+            decoded
+        };
+        let mut combined = BytesMut::with_capacity(self.bytes.len() + decoded.len());
+        combined.extend_from_slice(&self.bytes);
+        combined.extend_from_slice(&decoded);
+        self.bytes = combined.freeze();
+        // No await remains between decoding and publishing these bytes. A
+        // cancelled body read must retry this same header under the same seq.
+        self.compressed_seq = self.compressed_seq.wrapping_add(1);
+        Ok(true)
+    }
+
+    pub async fn next_async(&mut self) -> io::Result<Option<(u8, Packet)>> {
+        self.next_async_with_idle_timeout(None).await
+    }
+
+    // A new command resets both native NET counters. Authentication and
+    // LOCAL transfers instead consume the current exchange's writer counter.
+    pub(crate) async fn next_async_new_command(
+        &mut self,
+        idle: Option<std::time::Duration>,
+    ) -> io::Result<Option<(u8, Packet)>> {
+        if !self.new_command_in_progress {
+            self.reset_compressed_sequence();
+            self.new_command_in_progress = true;
+        }
+        let packet = self.next_async_with_idle_timeout(idle).await;
+        self.new_command_in_progress = false;
+        let packet = packet?;
+        check_sequence(packet, 0)
+    }
+
+    pub(crate) async fn next_async_in_exchange(
+        &mut self,
+        expected: u8,
+    ) -> io::Result<Option<(u8, Packet)>> {
+        // LOCAL admission can win over a pending next-command peek, then
+        // publish its filename request. This explicit same-exchange frontier
+        // supersedes the peek, without discarding its bytes or resetting NET.
+        self.new_command_in_progress = false;
+        let packet = self.next_async().await?;
+        check_sequence(packet, expected)
+    }
+
+    pub(crate) async fn next_async_with_idle_timeout(
+        &mut self,
+        idle: Option<std::time::Duration>,
+    ) -> io::Result<Option<(u8, Packet)>> {
         loop {
             let last_buffer_size = self.bytes.len();
+            // The compression envelope is a transport chunk, not the logical
+            // packet bound. Its decoded stream uses the same length gate.
+            if encoded_packet_exceeds_limit(&self.bytes, self.max_allowed_packet) {
+                return Err(packet_too_large());
+            }
             if !self.bytes.is_empty() {
                 match packet(self.bytes.clone().into()) {
                     Ok((rest, p)) => {
+                        if p.1.len() > self.max_allowed_packet {
+                            return Err(packet_too_large());
+                        }
                         self.bytes = rest.into();
                         return Ok(Some(p));
                     }
                     Err(nom::Err::Incomplete(_)) | Err(nom::Err::Error(_)) => {}
-                    Err(nom::Err::Failure(ctx)) => {
+                    Err(nom::Err::Failure(_)) => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("{ctx:?}"),
+                            "malformed MySQL packet framing",
                         ));
                     }
                 }
             }
 
+            if self.compression != CompressionAlgorithm::None {
+                if !self.read_compressed_frame(idle).await? {
+                    if self.bytes.is_empty() {
+                        return Ok(None);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("{} unhandled compressed bytes", self.bytes.len()),
+                    ));
+                }
+                continue;
+            }
             // read more buffer
-            let (start, mut buf) =
-                reuse_or_create_buf(std::mem::take(&mut self.bytes), last_buffer_size);
-
-            let read_cnt = self.r.read(&mut buf[start..]).await?;
-            buf.truncate(start + read_cnt);
-
-            self.bytes = buf.freeze();
+            let minimum = self.network_buffer_length()?;
+            let partial = !self.bytes.is_empty();
+            let mut buffer = ReadBufferGuard::new(&mut self.bytes, last_buffer_size, minimum);
+            let read_cnt = Self::read_network(
+                &mut self.r,
+                self.network_settings.as_ref(),
+                buffer.remaining(),
+                partial,
+                idle,
+            )
+            .await?;
+            buffer.complete(read_cnt);
+            drop(buffer);
 
             if read_cnt == 0 {
                 if self.bytes.is_empty() {
@@ -188,11 +576,64 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     }
 }
 
-pub fn fullpacket(i: NomBytes) -> nom::IResult<NomBytes, (u8, NomBytes)> {
-    let (i, _) = nom::bytes::complete::tag(&[0xff, 0xff, 0xff][..])(i)?;
-    let (i, seq) = nom::bytes::complete::take(1u8)(i)?;
-    let (i, bytes) = nom::bytes::complete::take(U24_MAX)(i)?;
-    Ok((i, (seq.as_ref()[0], bytes)))
+fn first_sequence(last: u8, length: usize) -> u8 {
+    last.wrapping_sub((length / U24_MAX) as u8)
+}
+
+fn check_sequence(packet: Option<(u8, Packet)>, expected: u8) -> io::Result<Option<(u8, Packet)>> {
+    if let Some((last, payload)) = &packet {
+        let received = first_sequence(*last, payload.len());
+        if received != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("MySQL packet out of order: received {received}, expected {expected}"),
+            ));
+        }
+    }
+    Ok(packet)
+}
+
+pub(crate) fn encoded_packet_exceeds_limit(input: &[u8], max_allowed_packet: usize) -> bool {
+    let mut offset = 0usize;
+    let mut payload_len = 0usize;
+    loop {
+        let Some(header) = input.get(offset..offset.saturating_add(4)) else {
+            return false;
+        };
+        let chunk_len =
+            usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+        payload_len = match payload_len.checked_add(chunk_len) {
+            Some(payload_len) if payload_len <= max_allowed_packet => payload_len,
+            _ => return true,
+        };
+        if chunk_len < crate::U24_MAX {
+            return false;
+        }
+        let Some(next) = offset
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(chunk_len))
+        else {
+            return true;
+        };
+        if input.len() < next {
+            return false;
+        }
+        offset = next;
+    }
+}
+
+fn packet_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "MySQL packet exceeds max_allowed_packet",
+    )
+}
+
+fn compressed_packet_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "compressed MySQL packet exceeds max_allowed_packet",
+    )
 }
 
 pub fn onepacket(i: NomBytes) -> nom::IResult<NomBytes, (u8, NomBytes)> {
@@ -304,161 +745,95 @@ impl nom::Slice<RangeFrom<usize>> for NomBytes {
     }
 }
 
-// a simple wrapper around bytes::Bytes to make sure interface stays the same
+// A packet owns its `Bytes`; parsing a command must not keep the reader mutably borrowed.
 #[derive(Clone)]
-pub struct Packet<'a> {
+pub struct Packet {
     bytes: bytes::Bytes,
-    _lifetime: PhantomData<&'a ()>, // NOTE: the lifetime can be removed since Bytes mangaes the lifetime by itself
 }
 
-impl Packet<'_> {
+impl Packet {
     fn from_bytes(bytes: bytes::Bytes) -> Self {
-        Packet {
-            bytes,
-            _lifetime: PhantomData,
+        Packet { bytes }
+    }
+
+    /// A zero-copy owner of a checked command-body range. Keeping this Bytes
+    /// alive protects the payload while the reader polls a successor packet.
+    pub fn owned_range(&self, range: std::ops::Range<usize>) -> io::Result<bytes::Bytes> {
+        if range.start > range.end || range.end > self.bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet range out of bounds",
+            ));
         }
+        Ok(self.bytes.slice(range))
     }
 }
 
 use crate::U24_MAX;
 use std::ops::Deref;
 
-impl Deref for Packet<'_> {
+impl Deref for Packet {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         self.bytes.as_ref()
     }
 }
 
-// note that for small packet, this function is zero-copy, but for packet >= 2^24 it currently copy stuff, this await further optimization
-pub(crate) fn packet<'a>(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet<'a>)> {
-    nom::combinator::map(
-        nom::sequence::pair(
-            nom::multi::fold_many0(
-                fullpacket,
-                || (0, None),
-                |(seq, pkt): (_, Option<BytesMut>), (nseq, p)| {
-                    let pkt = if let Some(mut pkt) = pkt {
-                        assert_eq!(nseq, seq + 1);
-                        pkt.extend_from_slice(p.as_ref());
-                        Some(pkt)
-                    } else {
-                        // TODO: avoid copy
-                        Some(BytesMut::from(p.0))
-                    };
-                    (nseq, pkt)
-                },
-            ),
-            nom::combinator::opt(onepacket),
-        ),
-        move |((full_seq, full_pkt), last)| match (full_pkt, last) {
-            (Some(mut full_pkt), Some((last_seq, last_pkt))) => {
-                assert_eq!(last_seq, full_seq + 1);
-                full_pkt.extend_from_slice(last_pkt.as_ref());
-                let final_pkt = full_pkt.freeze();
-                Ok((last_seq, Packet::from_bytes(final_pkt)))
-            }
-            (Some(full_pkt), None) => Ok((full_seq, Packet::from_bytes(full_pkt.freeze()))),
-            (None, Some((last_seq, last_pkt))) => Ok((last_seq, Packet::from_bytes(last_pkt.0))),
-            // TODO: might know length
-            (None, None) => Err(nom::Err::Incomplete(Needed::Unknown)),
-        },
-    )(i)
-    .map(|(rest, parsed)| match parsed {
-        Ok(parsed) => Ok((rest, parsed)),
-        Err(e) => Err(e),
-    })?
-}
-
-#[cfg(test)]
-mod test {
-    use bytes::{Buf, BufMut};
-
-    use super::*;
-
-    fn mock_packet(mut data: bytes::Bytes, start_seq: u8) -> bytes::Bytes {
-        let mut buf = BytesMut::new();
-        let mut seq = start_seq;
-        while data.len() > U24_MAX {
-            buf.extend_from_slice(&[0xff, 0xff, 0xff]);
-            buf.put_u8(seq);
-            buf.put(&data[0..U24_MAX]);
-            data.advance(U24_MAX);
-            seq += 1;
+// A complete small packet borrows its existing Bytes owner. Continuations
+// are validated in the same framing pass and joined only after the logical
+// packet is complete, never repeatedly while waiting for its final fragment.
+pub(crate) fn packet(i: NomBytes) -> nom::IResult<NomBytes, (u8, Packet)> {
+    let bytes = i.as_ref();
+    let malformed = || {
+        nom::Err::Failure(nom::error::Error::new(
+            i.clone(),
+            nom::error::ErrorKind::Verify,
+        ))
+    };
+    let mut offset = 0usize;
+    let mut length = 0usize;
+    let mut previous: Option<u8> = None;
+    let final_sequence;
+    loop {
+        let available = bytes.len() - offset;
+        if available < 4 {
+            return Err(nom::Err::Incomplete(Needed::new(4 - available)));
         }
-        if !data.is_empty() {
-            let le_u64: [u8; 8] = data.len().to_le_bytes();
-            let le_u24 = &le_u64[0..3];
-            buf.extend_from_slice(le_u24);
-            buf.put_u8(seq);
-            buf.put(data);
+        let header = &bytes[offset..offset + 4];
+        let chunk =
+            usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+        let sequence = header[3];
+        if previous.is_some_and(|previous| sequence != previous.wrapping_add(1)) {
+            return Err(malformed());
         }
-        buf.freeze()
+        if available - 4 < chunk {
+            return Err(nom::Err::Incomplete(Needed::new(chunk - (available - 4))));
+        }
+        length = length.checked_add(chunk).ok_or_else(malformed)?;
+        offset += 4 + chunk;
+        if chunk < U24_MAX {
+            final_sequence = sequence;
+            break;
+        }
+        previous = Some(sequence);
     }
-
-    #[tokio::test]
-    async fn test_various_packet_size() {
-        // test for off by one, and off by header size(3 bytes for length and 1 for seq num)
-        let testcases = [
-            0,
-            1,
-            2,
-            PACKET_BUFFER_SIZE - 1 - 4,
-            PACKET_BUFFER_SIZE - 1,
-            PACKET_BUFFER_SIZE,
-            PACKET_BUFFER_SIZE + 1,
-            PACKET_BUFFER_SIZE + 1 + 4,
-            PACKET_LARGE_BUFFER_SIZE - 4 - 1,
-            PACKET_LARGE_BUFFER_SIZE - 4,
-            PACKET_LARGE_BUFFER_SIZE - 1,
-            PACKET_LARGE_BUFFER_SIZE,
-            PACKET_LARGE_BUFFER_SIZE + 1,
-            PACKET_LARGE_BUFFER_SIZE + 4,
-            PACKET_LARGE_BUFFER_SIZE + 4 + 1,
-            U24_MAX - 4 - 1,
-            U24_MAX - 4,
-            U24_MAX - 1,
-            U24_MAX,
-            U24_MAX + 1,
-            U24_MAX + 4,
-            U24_MAX + 4 + 1,
-            U24_MAX * 2 - 4 - 1,
-            U24_MAX * 2 - 4,
-            U24_MAX * 2 - 1,
-            U24_MAX * 2,
-            U24_MAX * 2 + 1,
-            U24_MAX * 2 + 4,
-            U24_MAX * 2 + 4 + 1,
-        ];
-        for input_size in testcases {
-            let large_data = bytes::Bytes::from(vec![0; input_size]);
-            let packet = mock_packet(large_data, 0);
-            let mut reader = PacketReader::new(packet.reader());
-            let mut last_seq = 0;
-            let mut total_size = 0;
-            while let Some((seq, packet)) = reader.next().unwrap() {
-                if seq != 0 {
-                    assert!(seq > last_seq);
-                }
-                total_size += packet.len();
-                last_seq = seq;
-            }
-            assert_eq!(total_size, input_size);
+    let payload = if previous.is_none() {
+        i.0.slice(4..offset)
+    } else {
+        let mut payload = BytesMut::with_capacity(length);
+        let mut start = 0;
+        while start < offset {
+            let header = &bytes[start..start + 4];
+            let chunk = usize::from(header[0])
+                | (usize::from(header[1]) << 8)
+                | (usize::from(header[2]) << 16);
+            payload.extend_from_slice(&bytes[start + 4..start + 4 + chunk]);
+            start += 4 + chunk;
         }
-        for input_size in testcases {
-            let large_data = bytes::Bytes::from(vec![0; input_size]);
-            let packet = mock_packet(large_data, 0);
-            let mut reader = PacketReader::new(packet.as_ref());
-            let mut last_seq = 0;
-            let mut total_size = 0;
-            while let Some((seq, packet)) = reader.next_async().await.unwrap() {
-                if seq != 0 {
-                    assert!(seq > last_seq);
-                }
-                total_size += packet.len();
-                last_seq = seq;
-            }
-            assert_eq!(total_size, input_size);
-        }
-    }
+        payload.freeze()
+    };
+    Ok((
+        NomBytes(i.0.slice(offset..)),
+        (final_sequence, Packet::from_bytes(payload)),
+    ))
 }

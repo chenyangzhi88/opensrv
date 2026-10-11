@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -37,6 +37,12 @@ impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
         writers::write_ok_packet(self.writer, self.client_capabilities, OkResponse::default()).await
     }
 
+    /// Tell the client that the database context changed while preserving
+    /// backend-owned status, warnings and session tracking information.
+    pub async fn ok_with_response(self, response: OkResponse) -> io::Result<()> {
+        writers::write_ok_packet(self.writer, self.client_capabilities, response).await
+    }
+
     /// Tell client that there was a problem changing the database context.
     /// Although you can return any valid MySQL error code you probably want
     /// to keep it similar to the MySQL server and issue either a
@@ -46,6 +52,13 @@ impl<'a, W: 'a + AsyncWrite + Unpin> InitWriter<'a, W> {
         E: Borrow<[u8]> + ?Sized,
     {
         writers::write_err(kind, msg.borrow(), self.writer).await
+    }
+
+    pub async fn error_raw<E>(self, code: u16, sqlstate: &[u8; 5], msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        writers::write_err_raw(code, sqlstate, msg.borrow(), self.writer).await
     }
 }
 
@@ -76,15 +89,68 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
         <PI as IntoIterator>::IntoIter: ExactSizeIterator,
         <CI as IntoIterator>::IntoIter: ExactSizeIterator,
     {
+        self.reply_with_warnings(id, params, columns, 0).await
+    }
+
+    /// Reply to `COM_STMT_PREPARE`, including diagnostics raised while the
+    /// server derived statement metadata.
+    pub async fn reply_with_warnings<PI, CI>(
+        self,
+        id: u32,
+        params: PI,
+        columns: CI,
+        warnings: u16,
+    ) -> io::Result<()>
+    where
+        PI: IntoIterator<Item = &'a Column>,
+        CI: IntoIterator<Item = &'a Column>,
+        <PI as IntoIterator>::IntoIter: ExactSizeIterator,
+        <CI as IntoIterator>::IntoIter: ExactSizeIterator,
+    {
+        self.reply_with_warnings_and_metadata(id, params, columns, warnings, true)
+            .await
+    }
+
+    pub async fn reply_with_warnings_and_metadata<PI, CI>(
+        self,
+        id: u32,
+        params: PI,
+        columns: CI,
+        warnings: u16,
+        send_metadata: bool,
+    ) -> io::Result<()>
+    where
+        PI: IntoIterator<Item = &'a Column>,
+        CI: IntoIterator<Item = &'a Column>,
+        <PI as IntoIterator>::IntoIter: ExactSizeIterator,
+        <CI as IntoIterator>::IntoIter: ExactSizeIterator,
+    {
         let params = params.into_iter();
+        let Ok(parameter_count) = u16::try_from(params.len()) else {
+            return writers::write_err(
+                ErrorKind::ER_PS_MANY_PARAM,
+                b"Prepared statement contains too many placeholders",
+                self.writer,
+            )
+            .await;
+        };
         self.stmts.insert(
             id,
             StatementData {
-                params: params.len() as u16,
+                params: parameter_count,
                 ..Default::default()
             },
         );
-        writers::write_prepare_ok(id, params, columns, self.writer, self.client_capabilities).await
+        writers::write_prepare_ok(
+            id,
+            params,
+            columns,
+            warnings,
+            self.writer,
+            self.client_capabilities,
+            send_metadata,
+        )
+        .await
     }
 
     /// Reply to the client's `PREPARE` with an error.
@@ -94,11 +160,18 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
     {
         writers::write_err(kind, msg.borrow(), self.writer).await
     }
+
+    pub async fn error_raw<E>(self, code: u16, sqlstate: &[u8; 5], msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        writers::write_err_raw(code, sqlstate, msg.borrow(), self.writer).await
+    }
 }
 
 enum Finalizer {
     Ok(OkResponse),
-    Eof,
+    Eof(StatusFlags, u16),
 }
 
 /// Convenience type for providing query results to clients.
@@ -153,7 +226,10 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
                 }
                 writers::write_ok_packet(self.writer, self.client_capabilities, ok_packet).await
             }
-            Some(Finalizer::Eof) => writers::write_eof_packet(self.writer, status).await,
+            Some(Finalizer::Eof(mut final_status, warnings)) => {
+                final_status.insert(status);
+                writers::write_eof_packet(self.writer, final_status, warnings).await
+            }
         }
     }
 
@@ -162,9 +238,89 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     /// Note that if no columns are emitted, any written rows are ignored.
     ///
     /// See [`RowWriter`](struct.RowWriter.html).
-    pub async fn start(mut self, columns: &'a [Column]) -> io::Result<RowWriter<'a, W>> {
+    pub async fn start<'columns>(
+        mut self,
+        columns: &'columns [Column],
+    ) -> io::Result<RowWriter<'a, 'columns, W>> {
         self.finalize(true).await?;
-        RowWriter::new(self, columns).await
+        RowWriter::new(self, Cow::Borrowed(columns), true).await
+    }
+
+    /// Start a resultset whose column count remains present while column
+    /// definitions are omitted under CLIENT_OPTIONAL_RESULTSET_METADATA.
+    pub async fn start_without_metadata<'columns>(
+        mut self,
+        columns: &'columns [Column],
+    ) -> io::Result<RowWriter<'a, 'columns, W>> {
+        self.finalize(true).await?;
+        RowWriter::new(self, Cow::Borrowed(columns), false).await
+    }
+
+    /// Start a resultset with the column allocation moved into the same row writer.
+    /// The owned columns may outlive the producing call without borrowing its stack.
+    pub async fn start_owned(
+        mut self,
+        columns: Vec<Column>,
+    ) -> io::Result<RowWriter<'a, 'static, W>> {
+        self.finalize(true).await?;
+        RowWriter::new(self, Cow::Owned(columns), true).await
+    }
+
+    /// Start an owned-column resultset while omitting optional column definitions.
+    pub async fn start_without_metadata_owned(
+        mut self,
+        columns: Vec<Column>,
+    ) -> io::Result<RowWriter<'a, 'static, W>> {
+        self.finalize(true).await?;
+        RowWriter::new(self, Cow::Owned(columns), false).await
+    }
+
+    /// Reply to COM_FIELD_LIST with ColumnDefinition41 packets and no
+    /// result-set column-count packet. The legacy command also carries an
+    /// extra default-value field in every column definition.
+    pub async fn field_list(mut self, columns: &[Column]) -> io::Result<()> {
+        self.finalize(false).await?;
+        writers::write_column_definitions_41(columns, self.writer, self.client_capabilities, true)
+            .await
+    }
+
+    /// Reply to COM_FIELD_LIST and include the legacy per-column default
+    /// value. A `None` entry is encoded as SQL NULL.
+    pub async fn field_list_with_defaults(
+        mut self,
+        columns: &[Column],
+        defaults: &[Option<Vec<u8>>],
+    ) -> io::Result<()> {
+        self.finalize(false).await?;
+        writers::write_column_definitions_41_with_defaults(
+            columns,
+            self.writer,
+            self.client_capabilities,
+            true,
+            Some(defaults),
+        )
+        .await
+    }
+
+    /// Reply to COM_FIELD_LIST and publish the command's status and warnings in its EOF packet.
+    pub async fn field_list_with_defaults_and_status(
+        mut self,
+        columns: &[Column],
+        defaults: &[Option<Vec<u8>>],
+        status: StatusFlags,
+        warnings: u16,
+    ) -> io::Result<()> {
+        self.finalize(false).await?;
+        writers::write_column_definitions_41_with_defaults_and_status(
+            columns,
+            self.writer,
+            self.client_capabilities,
+            true,
+            Some(defaults),
+            status,
+            warnings,
+        )
+        .await
     }
 
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
@@ -195,10 +351,65 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         writers::write_err(kind, msg.borrow(), self.writer).await
     }
 
+    pub async fn error_raw<E>(mut self, code: u16, sqlstate: &[u8; 5], msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        self.finalize(true).await?;
+        writers::write_err_raw(code, sqlstate, msg.borrow(), self.writer).await
+    }
+
     /// Send the last bits of the last resultset to the client, and indicate that there are no more
     /// resultsets coming.
     pub async fn no_more_results(mut self) -> io::Result<()> {
         self.finalize(false).await
+    }
+
+    /// Publish a completed result immediately and mark that another result or error follows.
+    pub async fn flush_more_results(mut self) -> io::Result<Self> {
+        self.finalize(true).await?;
+        self.writer.flush_all().await?;
+        Ok(self)
+    }
+
+    /// Send cursor metadata without row data after COM_STMT_EXECUTE while preserving the current
+    /// server transaction state.
+    pub async fn cursor_open<'columns>(
+        mut self,
+        columns: &'columns [Column],
+        mut response: OkResponse,
+    ) -> io::Result<()> {
+        self.finalize(true).await?;
+        // Write the column count and definitions, but own the terminator below so it can carry
+        // SERVER_STATUS_CURSOR_EXISTS. Without this mask legacy EOF clients would receive two
+        // terminators and lose cursor state.
+        writers::column_definitions(
+            columns,
+            self.writer,
+            self.client_capabilities | CapabilityFlags::CLIENT_DEPRECATE_EOF,
+        )
+        .await?;
+        response
+            .status_flags
+            .insert(StatusFlags::SERVER_STATUS_CURSOR_EXISTS);
+        if self
+            .client_capabilities
+            .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+        {
+            response.header = 0xfe;
+            writers::write_ok_packet(self.writer, self.client_capabilities, response).await
+        } else {
+            writers::write_eof_packet(self.writer, response.status_flags, response.warnings).await
+        }
+    }
+
+    /// Start a COM_STMT_FETCH response; cursor fetch packets omit column definitions.
+    pub async fn start_cursor_fetch<'columns>(
+        mut self,
+        columns: &'columns [Column],
+    ) -> io::Result<RowWriter<'a, 'columns, W>> {
+        self.finalize(true).await?;
+        RowWriter::new_without_definitions(self, columns).await
     }
 }
 
@@ -209,18 +420,17 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
 /// [`end_row`](struct.RowWriter.html#method.end_row)), or one row at a time (using
 /// [`write_row`](struct.RowWriter.html#method.write_row)).
 ///
-/// This type *may* be dropped without calling
-/// [`write_row`](struct.RowWriter.html#method.write_row) or
-/// [`finish`](struct.RowWriter.html#method.finish). However, in this case, the program may panic
-/// if an I/O error occurs when sending the end-of-records marker to the client. To avoid this,
-/// call [`finish`](struct.RowWriter.html#method.finish) explicitly.
+/// Dropping this type does not perform IO or complete the resultset. Call an
+/// explicit finish method for a successful result or an error method for a
+/// terminal SQL error. An abandoned transport remains the connection owner's
+/// responsibility.
 #[must_use]
-pub struct RowWriter<'a, W: AsyncWrite + Unpin> {
+pub struct RowWriter<'a, 'columns, W: AsyncWrite + Unpin> {
     client_capabilities: CapabilityFlags,
     result: Option<QueryResultWriter<'a, W>>,
     bitmap_len: usize,
     data: Vec<u8>,
-    columns: &'a [Column],
+    columns: Cow<'columns, [Column]>,
 
     // next column to write for the current row
     // NOTE: (ab)used to track number of *rows* for a zero-column resultset
@@ -228,14 +438,15 @@ pub struct RowWriter<'a, W: AsyncWrite + Unpin> {
     finished: bool,
 }
 
-impl<'a, W> RowWriter<'a, W>
+impl<'a, 'columns, W> RowWriter<'a, 'columns, W>
 where
     W: 'a + AsyncWrite + Unpin,
 {
     async fn new(
         result: QueryResultWriter<'a, W>,
-        columns: &'a [Column],
-    ) -> io::Result<RowWriter<'a, W>> {
+        columns: Cow<'columns, [Column]>,
+        send_metadata: bool,
+    ) -> io::Result<RowWriter<'a, 'columns, W>> {
         let bitmap_len = (columns.len() + 7 + 2) / 8;
         let client_capabilities = result.client_capabilities;
         let mut rw = RowWriter {
@@ -249,17 +460,34 @@ where
 
             finished: false,
         };
-        rw.start().await?;
+        rw.start(send_metadata).await?;
         Ok(rw)
     }
 
+    async fn new_without_definitions(
+        result: QueryResultWriter<'a, W>,
+        columns: &'columns [Column],
+    ) -> io::Result<RowWriter<'a, 'columns, W>> {
+        let bitmap_len = (columns.len() + 7 + 2) / 8;
+        Ok(RowWriter {
+            client_capabilities: result.client_capabilities,
+            result: Some(result),
+            columns: Cow::Borrowed(columns),
+            bitmap_len,
+            data: Vec::new(),
+            col: 0,
+            finished: false,
+        })
+    }
+
     #[inline]
-    async fn start(&mut self) -> io::Result<()> {
+    async fn start(&mut self, send_metadata: bool) -> io::Result<()> {
         if !self.columns.is_empty() {
-            writers::column_definitions(
-                self.columns,
+            writers::column_definitions_with_metadata(
+                self.columns.as_ref(),
                 self.result.as_mut().unwrap().writer,
                 self.client_capabilities,
+                send_metadata,
             )
             .await?;
         }
@@ -267,12 +495,24 @@ where
         Ok(())
     }
 
+    /// Flush metadata and completed rows without ending the resultset.
+    /// An unfinished row must first be completed with `end_row`; no EOF/OK is sent.
+    /// A transport error is returned to the connection owner, not converted to success.
+    pub async fn flush_progress(&mut self) -> io::Result<()> {
+        if !self.columns.is_empty() && self.col != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot flush progress during an unfinished row",
+            ));
+        }
+        self.result.as_mut().unwrap().writer.flush_all().await
+    }
+
     /// Write a value to the next column of the current row as a part of this resultset.
     ///
     /// If you do not call [`end_row`](struct.RowWriter.html#method.end_row) after the last row,
     /// any errors that occur when writing out the last row will be returned by
-    /// [`finish`](struct.RowWriter.html#method.finish). If you do not call `finish` either, any
-    /// errors will cause a panic when the `RowWriter` is dropped.
+    /// [`finish`](struct.RowWriter.html#method.finish). Drop neither writes nor completes it.
     ///
     /// Note that the row *must* conform to the column specification provided to
     /// [`QueryResultWriter::start`](struct.QueryResultWriter.html#method.start). If it does not,
@@ -370,7 +610,7 @@ where
     }
 }
 
-impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
+impl<'a, 'columns, W: AsyncWrite + Unpin + 'a> RowWriter<'a, 'columns, W> {
     async fn finish_inner(&mut self, extra_info: &str, complete: bool) -> io::Result<()> {
         if self.finished {
             return Ok(());
@@ -402,7 +642,8 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else {
                 // we wrote out at least one row
-                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);
+                self.result.as_mut().unwrap().last_end =
+                    Some(Finalizer::Eof(StatusFlags::empty(), 0));
             }
         }
 
@@ -427,6 +668,74 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
             .await
     }
 
+    /// Finish a resultset while preserving server transaction/autocommit status.
+    pub async fn finish_with_status(self, status: StatusFlags) -> io::Result<()> {
+        self.finish_one_with_status(status)
+            .await?
+            .no_more_results()
+            .await
+    }
+
+    /// Finish one resultset while preserving server transaction/autocommit status.
+    pub async fn finish_one_with_status(
+        mut self,
+        status: StatusFlags,
+    ) -> io::Result<QueryResultWriter<'a, W>> {
+        self.finish_inner("", true).await?;
+        match self
+            .result
+            .as_mut()
+            .and_then(|result| result.last_end.as_mut())
+        {
+            Some(Finalizer::Ok(response)) => response.status_flags.insert(status),
+            Some(Finalizer::Eof(response_status, _)) => response_status.insert(status),
+            None => {}
+        }
+        Ok(self.result.take().unwrap())
+    }
+
+    /// Finish one result set and publish both status flags and the statement
+    /// warning count in the terminating EOF/OK packet.
+    pub async fn finish_one_with_status_and_warnings(
+        mut self,
+        status: StatusFlags,
+        warnings: u16,
+        session_state_info: Vec<u8>,
+    ) -> io::Result<QueryResultWriter<'a, W>> {
+        self.finish_inner("", true).await?;
+        match self
+            .result
+            .as_mut()
+            .and_then(|result| result.last_end.as_mut())
+        {
+            Some(Finalizer::Ok(response)) => {
+                response.status_flags.insert(status);
+                response.warnings = warnings;
+                response.session_state_info = session_state_info;
+            }
+            Some(Finalizer::Eof(response_status, response_warnings)) => {
+                response_status.insert(status);
+                *response_warnings = warnings;
+            }
+            None => {}
+        }
+        Ok(self.result.take().unwrap())
+    }
+
+    /// Close an open partial result only after a stored-program handler was selected.
+    /// Native handler boundaries use legacy EOF with zero warnings even when the
+    /// client negotiated DEPRECATE_EOF. Normal result completion is unchanged.
+    pub async fn finish_handled_partial(
+        mut self,
+        status: StatusFlags,
+    ) -> io::Result<QueryResultWriter<'a, W>> {
+        self.finish_inner("", false).await?;
+        let result = self.result.take().unwrap();
+        writers::write_eof_packet(result.writer, status, 0).await?;
+        result.writer.flush_all().await?;
+        Ok(result)
+    }
+
     /// End this resultset response, and indicate to the client that no more rows are coming.
     pub async fn finish_one_with_info(
         mut self,
@@ -439,13 +748,90 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
         Ok(self.result.take().unwrap())
     }
 
+    /// Finish one cursor fetch while preserving server transaction state. `last` reports
+    /// SERVER_STATUS_LAST_ROW_SENT; otherwise the cursor remains open and
+    /// SERVER_STATUS_CURSOR_EXISTS is preserved.
+    pub async fn finish_cursor(self, last: bool, response: OkResponse) -> io::Result<()> {
+        self.finish_cursor_one(last, response, false)
+            .await
+            .map(drop)
+    }
+
+    /// Finish a cursor result while retaining the writer so a stored
+    /// procedure's following resultsets can be emitted after the last fetch.
+    pub async fn finish_cursor_one(
+        mut self,
+        last: bool,
+        mut response: OkResponse,
+        more_results: bool,
+    ) -> io::Result<QueryResultWriter<'a, W>> {
+        self.finish_inner("", false).await?;
+        response.status_flags.insert(if last {
+            StatusFlags::SERVER_STATUS_LAST_ROW_SENT
+        } else {
+            StatusFlags::SERVER_STATUS_CURSOR_EXISTS
+        });
+        response
+            .status_flags
+            .set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, more_results);
+        let result = self.result.take().unwrap();
+        if result
+            .client_capabilities
+            .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+        {
+            response.header = 0xfe;
+            writers::write_ok_packet(result.writer, result.client_capabilities, response).await?;
+        } else {
+            writers::write_eof_packet(result.writer, response.status_flags, response.warnings)
+                .await?;
+        }
+        Ok(result)
+    }
+
     /// End this resultset response, and indicate to the client there was an error.
-    pub async fn finish_error<E>(mut self, kind: ErrorKind, msg: &E) -> io::Result<()>
+    pub async fn finish_error_one<E>(
+        mut self,
+        kind: ErrorKind,
+        msg: &E,
+    ) -> io::Result<QueryResultWriter<'a, W>>
     where
-        E: Borrow<[u8]>,
+        E: Borrow<[u8]> + ?Sized,
     {
         self.finish_inner("", false).await?;
+        let result = self.result.take().unwrap();
+        writers::write_err(kind, msg.borrow(), result.writer).await?;
+        Ok(result)
+    }
 
-        self.result.take().unwrap().error(kind, msg).await
+    pub async fn finish_error_one_raw<E>(
+        mut self,
+        code: u16,
+        sqlstate: &[u8; 5],
+        msg: &E,
+    ) -> io::Result<QueryResultWriter<'a, W>>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        self.finish_inner("", false).await?;
+        let result = self.result.take().unwrap();
+        writers::write_err_raw(code, sqlstate, msg.borrow(), result.writer).await?;
+        Ok(result)
+    }
+
+    /// End this resultset response, indicate an error, and close this response.
+    pub async fn finish_error<E>(self, kind: ErrorKind, msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        self.finish_error_one(kind, msg).await.map(drop)
+    }
+
+    pub async fn finish_error_raw<E>(self, code: u16, sqlstate: &[u8; 5], msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        self.finish_error_one_raw(code, sqlstate, msg)
+            .await
+            .map(drop)
     }
 }

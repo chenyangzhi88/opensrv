@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use pin_project_lite::pin_project;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
 use tokio_rustls::server::TlsStream;
-use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 
 use crate::commands::ClientHandshake;
 use crate::myc::constants::CapabilityFlags;
@@ -52,13 +52,31 @@ where
         shim,
         reader,
         writer,
+        zstd_compression_level: 3,
+        secure_transport: false,
     };
-    mi.init_after_ssl(handshake, seq).await?;
+    if let Err(error) = mi.init_after_ssl(handshake, seq).await {
+        let _ = mi.shim.on_disconnect().await;
+        return Err(error);
+    }
+    if mi
+        .client_capabilities
+        .contains(CapabilityFlags::CLIENT_COMPRESS)
+    {
+        mi.reader.enable_compression();
+        mi.writer.enable_compression();
+    } else if mi
+        .client_capabilities
+        .contains(CapabilityFlags::CLIENT_ZSTD_COMPRESSION_ALGORITHM)
+    {
+        mi.reader.enable_zstd_compression();
+        mi.writer.enable_zstd_compression(mi.zstd_compression_level);
+    }
     mi.run().await
 }
 
 pub async fn secure_run_with_options<B, R, W>(
-    shim: B,
+    mut shim: B,
     writer: W,
     opts: IntermediaryOptions,
     tls_config: Arc<ServerConfig>,
@@ -70,7 +88,9 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     let (handshake, seq, client_capabilities, reader) = init_params;
-    let (reader, writer) = switch_to_tls(tls_config, reader, writer).await?;
+    let (reader, writer, session, peer_certificates) =
+        switch_to_tls_session(tls_config, reader, writer).await?;
+    shim.on_tls_session(session, &peer_certificates)?;
     let reader = PacketReader::new(reader);
     let writer = PacketWriter::new(writer);
 
@@ -83,24 +103,111 @@ where
         shim,
         reader,
         writer,
+        zstd_compression_level: 3,
+        secure_transport: true,
     };
-    mi.init_after_ssl(handshake, seq).await?;
+    if let Err(error) = mi.init_after_ssl(handshake, seq).await {
+        let _ = mi.shim.on_disconnect().await;
+        return Err(error);
+    }
+    if mi
+        .client_capabilities
+        .contains(CapabilityFlags::CLIENT_COMPRESS)
+    {
+        mi.reader.enable_compression();
+        mi.writer.enable_compression();
+    } else if mi
+        .client_capabilities
+        .contains(CapabilityFlags::CLIENT_ZSTD_COMPRESSION_ALGORITHM)
+    {
+        mi.reader.enable_zstd_compression();
+        mi.writer.enable_zstd_compression(mi.zstd_compression_level);
+    }
     mi.run().await
 }
 
-pub async fn switch_to_tls<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin>(
+async fn switch_to_tls_session<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin>(
     config: Arc<ServerConfig>,
     reader: R,
     writer: W,
 ) -> std::io::Result<(
     ReadHalf<TlsStream<Duplex<R, W>>>,
     WriteHalf<TlsStream<Duplex<R, W>>>,
+    crate::TlsSessionInfo,
+    Vec<Vec<u8>>,
 )> {
     let stream = Duplex::new(reader, writer);
     let acceptor = TlsAcceptor::from(config);
     let stream = acceptor.accept(stream).await?;
+    let (_, connection) = stream.get_ref();
+    let session = tls_session_info(connection)?;
+    let peer_certificates = connection
+        .peer_certificates()
+        .unwrap_or_default()
+        .iter()
+        .map(|certificate| certificate.as_ref().to_vec())
+        .collect();
     let (r, w) = tokio::io::split(stream);
-    Ok((r, w))
+    Ok((r, w, session, peer_certificates))
+}
+
+/// Borrow the native name of an actually negotiated suite. Unknown suites
+/// must be reviewed before publication; Debug text is not a protocol fact.
+pub fn mysql_cipher_name(suite: tokio_rustls::rustls::CipherSuite) -> io::Result<&'static str> {
+    use tokio_rustls::rustls::CipherSuite as C;
+    Ok(match suite {
+        C::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => "ECDHE-ECDSA-AES256-GCM-SHA384",
+        C::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => "ECDHE-RSA-AES256-GCM-SHA384",
+        C::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => "ECDHE-ECDSA-AES128-GCM-SHA256",
+        C::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => "ECDHE-RSA-AES128-GCM-SHA256",
+        C::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => "ECDHE-ECDSA-CHACHA20-POLY1305",
+        C::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => "ECDHE-RSA-CHACHA20-POLY1305",
+        C::TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256",
+        C::TLS13_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384",
+        C::TLS13_CHACHA20_POLY1305_SHA256 => "TLS_CHACHA20_POLY1305_SHA256",
+        _ => {
+            return Err(io::Error::other(
+                "negotiated TLS cipher has no native MySQL name",
+            ));
+        }
+    })
+}
+
+/// Capture every required negotiated fact before splitting the actual
+/// stream. An unfinished/unknown handshake cannot publish a plaintext tuple.
+pub fn tls_session_info(
+    connection: &tokio_rustls::rustls::ServerConnection,
+) -> io::Result<crate::TlsSessionInfo> {
+    use tokio_rustls::rustls::{HandshakeKind, ProtocolVersion};
+    if connection.is_handshaking() {
+        return Err(io::Error::other("TLS handshake has not completed"));
+    }
+    let suite = connection
+        .negotiated_cipher_suite()
+        .ok_or_else(|| io::Error::other("completed TLS handshake has no negotiated cipher"))?;
+    let version = match connection.protocol_version() {
+        Some(ProtocolVersion::TLSv1_2) => "TLSv1.2",
+        Some(ProtocolVersion::TLSv1_3) => "TLSv1.3",
+        _ => {
+            return Err(io::Error::other(
+                "completed TLS handshake has no supported version",
+            ));
+        }
+    };
+    let reused = match connection.handshake_kind() {
+        Some(HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest) => false,
+        Some(HandshakeKind::Resumed) => true,
+        _ => {
+            return Err(io::Error::other(
+                "completed TLS handshake has no handshake kind",
+            ));
+        }
+    };
+    Ok(crate::TlsSessionInfo {
+        cipher: mysql_cipher_name(suite.suite())?,
+        version,
+        reused,
+    })
 }
 
 pin_project! {
