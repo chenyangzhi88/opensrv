@@ -24,6 +24,90 @@
 
 use std::io::Write as _;
 
+#[tokio::test]
+async fn optional_metadata_column_count_and_definitions_use_the_existing_lenenc_writer() {
+    use crate::{Column, ColumnFlags, ColumnType};
+    for optional in [false, true] {
+        for full in [false, true] {
+            for deprecate in [false, true] {
+                for count in [0usize, 2, 251] {
+                    let mut capabilities = CapabilityFlags::CLIENT_PROTOCOL_41;
+                    capabilities.set(
+                        CapabilityFlags::CLIENT_OPTIONAL_RESULTSET_METADATA,
+                        optional,
+                    );
+                    capabilities.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate);
+                    let send_metadata = full || !optional;
+                    let columns = vec![
+                        Column {
+                            database: Vec::new(),
+                            table: Vec::new(),
+                            org_table: Vec::new(),
+                            column: b"native".to_vec(),
+                            org_column: Vec::new(),
+                            collen: 11,
+                            charset: Some(63),
+                            coltype: ColumnType::MYSQL_TYPE_LONG,
+                            colflags: ColumnFlags::BINARY_FLAG,
+                            decimals: None,
+                        };
+                        count
+                    ];
+                    let mut output = Vec::new();
+                    {
+                        let mut writer = PacketWriter::new(&mut output);
+                        crate::writers::column_definitions_with_metadata(
+                            &columns,
+                            &mut writer,
+                            capabilities,
+                            send_metadata,
+                        )
+                        .await
+                        .unwrap();
+                        writer.flush_all().await.unwrap();
+                    }
+                    let mut reader = crate::packet_reader::PacketReader::new(output.as_slice());
+                    let (sequence, header) = reader.next_async().await.unwrap().unwrap();
+                    assert_eq!(sequence, 0);
+                    let mut expected = if count == 251 {
+                        vec![0xfc, 0xfb, 0]
+                    } else {
+                        vec![count as u8]
+                    };
+                    if optional {
+                        expected.push(u8::from(send_metadata));
+                    }
+                    assert_eq!(header.as_ref(), expected.as_slice());
+                    let mut sequence = 1u8;
+                    if send_metadata {
+                        for _ in &columns {
+                            let (actual, field) = reader.next_async().await.unwrap().unwrap();
+                            assert_eq!(actual, sequence);
+                            sequence = sequence.wrapping_add(1);
+                            assert_eq!(&field[..4], b"\x03def");
+                        }
+                        if !deprecate {
+                            let (actual, eof) = reader.next_async().await.unwrap().unwrap();
+                            assert_eq!(actual, sequence);
+                            assert_eq!(eof.len(), 5);
+                            assert_eq!(eof[0], 0xfe);
+                        }
+                    }
+                    assert!(
+                        reader.next_async().await.unwrap().is_none(),
+                        "NONE has no definitions or implicit metadata EOF"
+                    );
+                    assert_eq!(
+                        columns.len(),
+                        count,
+                        "presentation does not mutate the real descriptor"
+                    );
+                }
+            }
+        }
+    }
+}
+
 mod metadata {
     use crate::packet_writer::PacketWriter;
     use crate::writers::*;

@@ -20,7 +20,7 @@ use byteorder::WriteBytesExt;
 use mysql_common::constants::{CapabilityFlags, ColumnFlags, StatusFlags};
 use tokio::io::AsyncWrite;
 
-use crate::packet_writer::PacketWriter;
+use crate::packet_writer::{PacketBuilder, PacketWriter};
 use crate::value::ToMysqlValue;
 use crate::{writers, OkResponse};
 use crate::{Column, ErrorKind, StatementData};
@@ -198,6 +198,11 @@ pub struct QueryResultWriter<'a, W> {
 }
 
 impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
+    /// The negotiated capabilities of this actual response owner.
+    pub fn client_capabilities(&self) -> CapabilityFlags {
+        self.client_capabilities
+    }
+
     pub(crate) fn new(
         writer: &'a mut PacketWriter<W>,
         is_bin: bool,
@@ -373,20 +378,24 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     }
 
     /// Send cursor metadata without row data after COM_STMT_EXECUTE while preserving the current
-    /// server transaction state.
+    /// server transaction state. `send_metadata` is the caller's validated
+    /// FULL/NONE selector; omitting definitions does not change the columns
+    /// retained by the actual cursor producer or used by COM_STMT_FETCH.
     pub async fn cursor_open(
         mut self,
         columns: &[Column],
         mut response: OkResponse,
+        send_metadata: bool,
     ) -> io::Result<()> {
         self.finalize(true).await?;
         // Write the column count and definitions, but own the terminator below so it can carry
         // SERVER_STATUS_CURSOR_EXISTS. Without this mask legacy EOF clients would receive two
         // terminators and lose cursor state.
-        writers::column_definitions(
+        writers::column_definitions_with_metadata(
             columns,
             self.writer,
             self.client_capabilities | CapabilityFlags::CLIENT_DEPRECATE_EOF,
+            send_metadata,
         )
         .await?;
         response
@@ -401,6 +410,26 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         } else {
             writers::write_eof_packet(self.writer, response.status_flags, response.warnings).await
         }
+    }
+
+    /// Native regular Execute can remain bound to its original materializing
+    /// sink. SQL still materializes, but SEND_NUM_ROWS metadata ends with the
+    /// command DA's ordinary OK, not CURSOR_EXISTS or a resultset EOF.
+    pub async fn materialized_result(
+        mut self,
+        columns: &[Column],
+        response: OkResponse,
+        send_metadata: bool,
+    ) -> io::Result<()> {
+        self.finalize(true).await?;
+        writers::column_definitions_with_metadata(
+            columns,
+            self.writer,
+            self.client_capabilities | CapabilityFlags::CLIENT_DEPRECATE_EOF,
+            send_metadata,
+        )
+        .await?;
+        writers::write_ok_packet(self.writer, self.client_capabilities, response).await
     }
 
     /// Start a COM_STMT_FETCH response; cursor fetch packets omit column definitions.
@@ -429,7 +458,7 @@ pub struct RowWriter<'a, 'columns, W: AsyncWrite + Unpin> {
     client_capabilities: CapabilityFlags,
     result: Option<QueryResultWriter<'a, W>>,
     bitmap_len: usize,
-    data: Vec<u8>,
+    data: PacketBuilder,
     columns: Cow<'columns, [Column]>,
 
     // next column to write for the current row
@@ -449,12 +478,13 @@ where
     ) -> io::Result<RowWriter<'a, 'columns, W>> {
         let bitmap_len = (columns.len() + 7 + 2) / 8;
         let client_capabilities = result.client_capabilities;
+        let data = PacketBuilder::with_admission(result.writer.allocation_admission());
         let mut rw = RowWriter {
             client_capabilities,
             result: Some(result),
             columns,
             bitmap_len,
-            data: Vec::new(),
+            data,
 
             col: 0,
 
@@ -469,12 +499,13 @@ where
         columns: &'columns [Column],
     ) -> io::Result<RowWriter<'a, 'columns, W>> {
         let bitmap_len = (columns.len() + 7 + 2) / 8;
+        let data = PacketBuilder::with_admission(result.writer.allocation_admission());
         Ok(RowWriter {
             client_capabilities: result.client_capabilities,
             result: Some(result),
             columns: Cow::Borrowed(columns),
             bitmap_len,
-            data: Vec::new(),
+            data,
             col: 0,
             finished: false,
         })
@@ -531,7 +562,7 @@ where
                 self.result.as_mut().unwrap().writer.write_u8(0x00)?;
 
                 // leave space for nullmap
-                self.data.resize(self.bitmap_len, 0);
+                self.data.resize_zeroed(self.bitmap_len)?;
             }
 
             let c = self.columns.get(self.col).ok_or_else(|| {
@@ -550,7 +581,7 @@ where
                     // https://web.archive.org/web/20170404144156/https://dev.mysql.com/doc/internals/en/null-bitmap.html
                     // NULL-bitmap-byte = ((field-pos + offset) / 8)
                     // NULL-bitmap-bit  = ((field-pos + offset) % 8)
-                    self.data[(self.col + 2) / 8] |= 1u8 << ((self.col + 2) % 8);
+                    self.data.as_mut_slice()[(self.col + 2) / 8] |= 1u8 << ((self.col + 2) % 8);
                 }
             } else {
                 v.to_mysql_bin(&mut self.data, c)?;
@@ -581,7 +612,7 @@ where
                 .as_mut()
                 .unwrap()
                 .writer
-                .write_all(&self.data[..])?;
+                .write_all(self.data.as_slice())?;
             self.data.clear();
         }
         self.result.as_mut().unwrap().writer.end_packet().await?;
@@ -611,6 +642,10 @@ where
 }
 
 impl<'a, 'columns, W: AsyncWrite + Unpin + 'a> RowWriter<'a, 'columns, W> {
+    pub fn client_capabilities(&self) -> CapabilityFlags {
+        self.client_capabilities
+    }
+
     async fn finish_inner(&mut self, extra_info: &str, complete: bool) -> io::Result<()> {
         if self.finished {
             return Ok(());

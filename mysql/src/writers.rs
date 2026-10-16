@@ -272,19 +272,6 @@ where
     }
 }
 
-pub(crate) async fn column_definitions<'a, I, W>(
-    i: I,
-    w: &mut PacketWriter<W>,
-    client_capabilities: CapabilityFlags,
-) -> io::Result<()>
-where
-    I: IntoIterator<Item = &'a Column>,
-    <I as IntoIterator>::IntoIter: ExactSizeIterator,
-    W: AsyncWrite + Unpin,
-{
-    column_definitions_with_metadata(i, w, client_capabilities, true).await
-}
-
 pub(crate) async fn column_definitions_with_metadata<'a, I, W>(
     i: I,
     w: &mut PacketWriter<W>,

@@ -46,9 +46,7 @@ impl<W> Write for PacketWriter<W> {
                 let minimum = read()?.buffer_length;
                 if self.packet_builder.buffer.capacity() < minimum {
                     self.packet_builder
-                        .buffer
-                        .try_reserve(minimum.saturating_sub(self.packet_builder.buffer.len()))
-                        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+                        .reserve(minimum.saturating_sub(self.packet_builder.buffer.len()))?;
                 }
             }
         }
@@ -74,6 +72,17 @@ impl<W> PacketWriter<W> {
     pub(crate) fn set_network_settings(&mut self, settings: Option<crate::NetworkSettings>) {
         self.network_settings = settings;
     }
+    pub(crate) fn set_allocation_admission(
+        &mut self,
+        admission: Option<crate::CommandAllocationAdmission>,
+    ) {
+        self.packet_builder.admission = admission;
+    }
+
+    pub(crate) fn allocation_admission(&self) -> Option<crate::CommandAllocationAdmission> {
+        self.packet_builder.admission.clone()
+    }
+
     pub fn set_seq(&mut self, seq: u8) {
         self.packet_builder.set_seq(seq);
     }
@@ -156,21 +165,29 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
                 // Compression wraps the classic packet byte stream. Build the classic stream
                 // first so payloads over 0xFFFFFF bytes retain their continuation headers (and
                 // the required zero-length terminator at an exact boundary).
-                let mut plain = Vec::with_capacity(raw_packet.len() + 8);
-                append_classic_packets(&mut plain, &raw_packet, builder);
-                for chunk in plain.chunks(U24_MAX) {
+                let mut plain = PacketBuilder::with_admission(builder.admission.clone());
+                append_classic_packets(&mut plain, raw_packet.as_slice(), builder)?;
+                for chunk in plain.as_slice().chunks(U24_MAX) {
                     let compressed = match self.compression {
                         CompressionAlgorithm::Zlib => {
-                            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                            let mut encoder = ZlibEncoder::new(
+                                PacketBuilder::with_admission(self.allocation_admission()),
+                                Compression::default(),
+                            );
                             encoder.write_all(chunk)?;
                             encoder.finish()?
                         }
                         CompressionAlgorithm::Zstd => {
-                            zstd::stream::encode_all(chunk, self.zstd_level)?
+                            let mut encoder = zstd::stream::write::Encoder::new(
+                                PacketBuilder::with_admission(self.allocation_admission()),
+                                self.zstd_level,
+                            )?;
+                            encoder.write_all(chunk)?;
+                            encoder.finish()?
                         }
                         CompressionAlgorithm::None => unreachable!(),
                     };
-                    let (payload, uncompressed_len) = if compressed.len() < chunk.len() {
+                    let (payload, uncompressed_len) = if compressed.as_slice().len() < chunk.len() {
                         (compressed.as_slice(), chunk.len())
                     } else {
                         (chunk, 0)
@@ -183,12 +200,16 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
                     self.write_network(&header).await?;
                     self.write_network(payload).await?;
                 }
+                drop(plain);
+                drop(raw_packet);
                 return Ok(());
             }
 
-            let mut plain = Vec::with_capacity(raw_packet.len() + 8);
-            append_classic_packets(&mut plain, &raw_packet, builder);
-            self.write_network(&plain).await?;
+            let mut plain = PacketBuilder::with_admission(builder.admission.clone());
+            append_classic_packets(&mut plain, raw_packet.as_slice(), builder)?;
+            self.write_network(plain.as_slice()).await?;
+            drop(plain);
+            drop(raw_packet);
             Ok(())
         } else {
             Ok(())
@@ -225,33 +246,50 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     }
 }
 
-fn append_classic_packets(output: &mut Vec<u8>, payload: &[u8], builder: &mut PacketBuilder) {
+fn append_classic_packets(
+    output: &mut PacketBuilder,
+    payload: &[u8],
+    builder: &mut PacketBuilder,
+) -> io::Result<()> {
+    let headers = payload
+        .len()
+        .checked_div(U24_MAX)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| count.checked_mul(PACKET_HEADER_SIZE))
+        .and_then(|size| size.checked_add(payload.len()))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "MySQL packet framing overflow")
+        })?;
+    output.reserve(headers)?;
     for chunk in payload.chunks(U24_MAX) {
         let mut header = [0; PACKET_HEADER_SIZE];
         LittleEndian::write_u24(&mut header, chunk.len() as u32);
         header[3] = builder.seq();
+        output.write_all(&header)?;
+        output.write_all(chunk)?;
         builder.increase_seq();
-        output.extend_from_slice(&header);
-        output.extend_from_slice(chunk);
     }
     if payload.len() % U24_MAX == 0 {
-        output.extend_from_slice(&[0, 0, 0, builder.seq()]);
+        output.write_all(&[0, 0, 0, builder.seq()])?;
         builder.increase_seq();
     }
+    Ok(())
 }
 
 // Builder that exports as sync `Write`, so that  trivial scattered async writes
 // could be avoided during constructing the packet, especially the writes in mod [writers]
-struct PacketBuilder {
+pub(crate) struct PacketBuilder {
     buffer: Vec<u8>,
+    // Fields drop in declaration order: bytes retire before their grant.
+    allocation: Option<crate::CommandAllocation>,
+    admission: Option<crate::CommandAllocationAdmission>,
     seq: u8,
 }
 
 impl Write for PacketBuilder {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Here we take them all, and split them into raw packets later in `end_packet` if the size
-        // of buffer is larger than max payload size (16MB)
-        self.buffer.extend(buf);
+        self.reserve(buf.len())?;
+        self.buffer.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -262,18 +300,87 @@ impl Write for PacketBuilder {
 
 impl PacketBuilder {
     pub fn new() -> Self {
-        PacketBuilder {
-            buffer: vec![],
+        Self::with_admission(None)
+    }
+
+    pub(crate) fn with_admission(admission: Option<crate::CommandAllocationAdmission>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            allocation: None,
+            admission,
             seq: 0,
         }
+    }
+
+    /// Choose a capacity, admit it, and only then allocate its replacement.
+    /// Power-of-two capacities are an explicit amortized buffer policy, not a
+    /// multiplier used to estimate encoded values or allocator-private buckets.
+    /// The old bytes and their permit stay intact through every failure.
+    pub(crate) fn reserve(&mut self, additional: usize) -> io::Result<()> {
+        let required = self.buffer.len().checked_add(additional).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "MySQL packet capacity overflow")
+        })?;
+        if required <= self.buffer.capacity() {
+            return Ok(());
+        }
+        let capacity = required.checked_next_power_of_two().unwrap_or(required);
+        let mut allocation = self
+            .admission
+            .as_ref()
+            .map(|admit| admit(capacity))
+            .transpose()?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(capacity)
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        // std does not promise an allocator-exact capacity. Any reported extra
+        // capacity is admitted before publishing or copying into this buffer.
+        if replacement.capacity() != capacity {
+            allocation = self
+                .admission
+                .as_ref()
+                .map(|admit| admit(replacement.capacity()))
+                .transpose()?;
+        }
+        replacement.extend_from_slice(&self.buffer);
+        let previous_buffer = std::mem::replace(&mut self.buffer, replacement);
+        let previous_allocation = std::mem::replace(&mut self.allocation, allocation);
+        drop(previous_buffer);
+        drop(previous_allocation);
+        Ok(())
+    }
+
+    pub(crate) fn resize_zeroed(&mut self, length: usize) -> io::Result<()> {
+        self.reserve(length.saturating_sub(self.buffer.len()))?;
+        self.buffer.resize(length, 0);
+        Ok(())
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+
+    pub(crate) fn clear(&mut self) {
+        // clear retains the physical allocation and therefore its same permit.
+        self.buffer.clear();
     }
 
     fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
-    fn take_buffer(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buffer)
+    fn take_buffer(&mut self) -> Self {
+        // Move the existing physical byte owner with its same grant. The
+        // returned original builder drops bytes before its grant on every
+        // success, I/O failure and cancelled future, not just the happy path.
+        let mut packet = Self::with_admission(self.admission.clone());
+        std::mem::swap(&mut packet.buffer, &mut self.buffer);
+        std::mem::swap(&mut packet.allocation, &mut self.allocation);
+        packet
     }
 
     fn set_seq(&mut self, seq: u8) {

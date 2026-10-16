@@ -29,6 +29,7 @@ struct LocalInfileShim {
     blocked_finish: bool,
     finish_drops: Arc<AtomicUsize>,
     prepared_executions: Arc<AtomicUsize>,
+    filename: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -106,7 +107,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for LocalInfileShim {
         }
         self.starts.fetch_add(1, Ordering::Relaxed);
         Ok(LocalInfilePreflight::Request {
-            filename: b"rows.tsv".to_vec(),
+            filename: self.filename.as_deref().unwrap_or(b"rows.tsv").to_vec(),
             results,
         })
     }
@@ -213,6 +214,7 @@ async fn excluded_bug17667_text_and_prepared_sources_preserve_all_native_nul_len
             writer: PacketWriter::new(&mut output),
             zstd_compression_level: 0,
             secure_transport: false,
+            uncompressed_allowed: true,
         };
         intermediary.run_commands().await.unwrap();
     }
@@ -257,6 +259,7 @@ async fn query_and_prepare_reach_the_backend_as_the_exact_packet_bytes() {
         writer: PacketWriter::new(tokio::io::sink()),
         zstd_compression_level: 0,
         secure_transport: false,
+        uncompressed_allowed: true,
     };
     intermediary.run_commands().await.unwrap();
     assert_eq!(
@@ -293,6 +296,7 @@ async fn local_preflight_error_and_disabled_capability_never_send_a_filename_req
                 writer: PacketWriter::new(&mut output),
                 zstd_compression_level: 0,
                 secure_transport: false,
+                uncompressed_allowed: true,
             };
             intermediary.run_commands().await.unwrap();
             assert_eq!(intermediary.shim.commands_received, 2);
@@ -332,6 +336,7 @@ async fn eof_drops_the_actual_pending_preflight_before_cancel_without_sending_0x
             writer: PacketWriter::new(&mut output),
             zstd_compression_level: 0,
             secure_transport: false,
+            uncompressed_allowed: true,
         };
         let error = intermediary.run_commands().await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
@@ -396,6 +401,7 @@ async fn local_upload_keeps_its_exchange_and_following_command_restarts_both_cou
                 writer,
                 zstd_compression_level: 3,
                 secure_transport: false,
+                uncompressed_allowed: true,
             };
             let result = intermediary.run_commands().await;
             if valid {
@@ -462,6 +468,7 @@ async fn eof_drops_actual_local_execution_after_data_without_publishing_a_comple
             writer: PacketWriter::new(&mut output),
             zstd_compression_level: 0,
             secure_transport: false,
+            uncompressed_allowed: true,
         };
         let error = intermediary.run_commands().await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
@@ -497,6 +504,7 @@ async fn oversized_local_infile_is_drained_and_the_next_command_is_read() {
         writer: PacketWriter::new(tokio::io::sink()),
         zstd_compression_level: 0,
         secure_transport: false,
+        uncompressed_allowed: true,
     };
 
     intermediary.run_commands().await.unwrap();
@@ -508,4 +516,54 @@ async fn oversized_local_infile_is_drained_and_the_next_command_is_read() {
     assert_eq!(data_packets.load(Ordering::Relaxed), 1);
     assert_eq!(aborts.load(Ordering::Relaxed), 1);
     assert_eq!(ends.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn local_filename_request_transports_non_utf8_octets_and_preserves_exchange_sequence() {
+    let filename = b"raw\xff\x81\xca\xee\xf9\xfa\x54.tsv";
+    let shim = LocalInfileShim {
+        filename: Some(filename.to_vec()),
+        ..Default::default()
+    };
+    let sources = Arc::clone(&shim.sources);
+    let ends = Arc::clone(&shim.ends);
+    let data = Arc::clone(&shim.data_packets);
+    let query = b"LOAD DATA LOCAL INFILE 'raw\xff' INTO TABLE rows";
+    let mut input = framed(0, &[&[3][..], query].concat());
+    input.extend(framed(2, b"7\n"));
+    input.extend(framed(3, b""));
+    input.extend(framed(0, &[0x0e]));
+    let mut output = Vec::new();
+    {
+        let mut intermediary = AsyncMysqlIntermediary {
+            client_capabilities: CapabilityFlags::CLIENT_LOCAL_FILES,
+            process_use_statement_on_query: true,
+            reject_connection_on_dbname_absence: false,
+            shim,
+            reader: PacketReader::new(input.as_slice()),
+            writer: PacketWriter::new(&mut output),
+            zstd_compression_level: 0,
+            secure_transport: false,
+            uncompressed_allowed: true,
+        };
+        intermediary.run_commands().await.unwrap();
+        assert_eq!(intermediary.shim.commands_received, 2);
+    }
+    let mut packets = PacketReader::new(output.as_slice());
+    let (sequence, request) = packets.next_async().await.unwrap().unwrap();
+    assert_eq!(sequence, 1);
+    assert_eq!(
+        request.as_ref(),
+        [&[0xfb][..], filename].concat().as_slice()
+    );
+    let (sequence, completed) = packets.next_async().await.unwrap().unwrap();
+    assert_eq!(sequence, 4);
+    assert_eq!(completed[0], 0);
+    let (sequence, ping) = packets.next_async().await.unwrap().unwrap();
+    assert_eq!(sequence, 1);
+    assert_eq!(ping[0], 0);
+    assert!(packets.next_async().await.unwrap().is_none());
+    assert_eq!(sources.lock().unwrap().as_slice(), &[query.to_vec()]);
+    assert_eq!(data.load(Ordering::Relaxed), 1);
+    assert_eq!(ends.load(Ordering::Relaxed), 1);
 }

@@ -52,7 +52,7 @@ fn handshake_attributes_are_required_only_when_both_peers_support_them() {
                 assert_eq!(
                     handshake.connection_attrs,
                     if client_supports && server_supports {
-                        vec![(b"k".to_vec(), b"v".to_vec())]
+                        b"\x01k\x01v".to_vec()
                     } else {
                         vec![]
                     }
@@ -121,10 +121,7 @@ fn protocol41_auth_encodings_keep_database_plugin_and_attributes_at_the_actual_b
             assert_eq!(handshake.auth_response, password);
             assert_eq!(handshake.db.as_deref(), Some(&b"database"[..]));
             assert_eq!(handshake.auth_plugin, b"mysql_native_password");
-            assert_eq!(
-                handshake.connection_attrs,
-                vec![(b"k".to_vec(), b"v".to_vec())]
-            );
+            assert_eq!(handshake.connection_attrs, b"\x01k\x01v".to_vec());
         }
     }
     // An absent or oversized auth length must not consume a declared DB or
@@ -158,10 +155,7 @@ fn protocol41_auth_encodings_keep_database_plugin_and_attributes_at_the_actual_b
     assert!(tail.is_empty());
     assert_eq!(handshake.auth_response, password);
     assert_eq!(handshake.db.as_deref(), Some(&b"database"[..]));
-    assert_eq!(
-        handshake.connection_attrs,
-        vec![(b"k".to_vec(), b"v".to_vec())]
-    );
+    assert_eq!(handshake.connection_attrs, b"\x01k\x01v".to_vec());
 }
 
 #[test]
@@ -191,8 +185,61 @@ fn declared_connection_attributes_require_length_and_reject_native_64k_overflow(
     assert!(tail.is_empty());
     assert_eq!(
         handshake.connection_attrs,
-        vec![(b"k".to_vec(), vec![b'v'; 65_530])]
+        [b"\x01k\xfc\xfa\xff".as_slice(), &vec![b'v'; 65_530]].concat()
     );
+}
+
+#[test]
+fn native_attribute_outer_null_is_rejected_and_nine_byte_marker_keeps_uint64_length() {
+    let capabilities = CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_CONNECT_ATTRS;
+    let parse = |outer: &[u8]| {
+        let mut input = capabilities.bits().to_le_bytes().to_vec();
+        input.extend_from_slice(&1024u32.to_le_bytes());
+        input.push(33);
+        input.extend_from_slice(&[0; 23]);
+        input.extend_from_slice(b"login\0\0");
+        input.extend_from_slice(outer);
+        client_handshake(&input, false, capabilities)
+            .map(|(remaining, handshake)| {
+                assert!(remaining.is_empty());
+                handshake.connection_attrs
+            })
+            .map_err(|error| error.to_owned())
+    };
+    assert!(parse(b"\xfb").is_err());
+    for marker in [0xfe, 0xff] {
+        assert_eq!(
+            parse(&[marker, 4, 0, 0, 0, 0, 0, 0, 0, 1, b'k', 1, b'v']).unwrap(),
+            b"\x01k\x01v"
+        );
+        assert!(
+            parse(&[marker, 4, 0, 0, 0, 1, 0, 0, 0, 1, b'k', 1, b'v']).is_err(),
+            "outer native length is uint64, unlike PFS inner low uint32"
+        );
+    }
+}
+
+#[test]
+fn handshake_retains_malformed_inner_lenenc_and_non_utf8_as_raw_native_payload() {
+    let capabilities = CapabilityFlags::CLIENT_PROTOCOL_41 | CapabilityFlags::CLIENT_CONNECT_ATTRS;
+    for raw in [
+        b"\x01k\x01\xff".as_slice(),
+        b"\xfb",
+        b"\xfc\x01",
+        b"\x01k\x05v",
+    ] {
+        let mut input = capabilities.bits().to_le_bytes().to_vec();
+        input.extend_from_slice(&1024u32.to_le_bytes());
+        input.push(33);
+        input.extend_from_slice(&[0; 23]);
+        input.extend_from_slice(b"login\0\0");
+        input.push(raw.len() as u8);
+        input.extend_from_slice(raw);
+        let (tail, handshake) = client_handshake(&input, false, capabilities).unwrap();
+        assert!(tail.is_empty());
+        assert_eq!(handshake.connection_attrs, raw);
+        assert_eq!(handshake.collation, 33);
+    }
 }
 
 #[test]

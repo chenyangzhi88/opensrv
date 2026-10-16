@@ -111,8 +111,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         _user: &[u8],
         _character_set: u16,
         _initial_handshake: bool,
-    ) -> &'static str {
-        "mysql_native_password"
+    ) -> Result<(&'static str, Option<&'static [u8]>), Self::Error> {
+        Ok(("mysql_native_password", None))
     }
 
     fn salt(&self) -> [u8; 20] {

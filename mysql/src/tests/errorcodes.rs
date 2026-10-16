@@ -330,3 +330,115 @@ fn enumeration_count_and_character_width_have_distinct_native_packets() {
         ErrorKind::ER_TOO_LONG_SET_ENUM_VALUE
     );
 }
+#[test]
+fn engine_attribute_native_numbers_keep_distinct_hy000_mappings_and_depth_keeps22032() {
+    for (kind, number) in [
+        (
+            crate::errorcodes::ErrorKind::ER_INVALID_JSON_ATTRIBUTE,
+            3980,
+        ),
+        (
+            crate::errorcodes::ErrorKind::ER_ENGINE_ATTRIBUTE_NOT_SUPPORTED,
+            3981,
+        ),
+    ] {
+        assert_eq!(kind as u16, number);
+        assert_eq!(crate::errorcodes::ErrorKind::from_code(number), Some(kind));
+        assert_eq!(crate::errorcodes::ErrorKind::from(number), kind);
+        assert_eq!(kind.sqlstate(), b"HY000");
+    }
+    assert_eq!(
+        crate::errorcodes::ErrorKind::ER_JSON_DOCUMENT_TOO_DEEP.sqlstate(),
+        b"22032"
+    );
+    assert_eq!(
+        crate::errorcodes::ErrorKind::ER_INVALID_JSON_TEXT.sqlstate(),
+        b"22032"
+    );
+    assert_eq!(crate::errorcodes::ErrorKind::from_code(u16::MAX), None);
+}
+#[test]
+fn derived_hint_native_warning_kinds_roundtrip_without_changing_existing_numbers() {
+    for (number, kind) in [
+        (3126, ErrorKind::ER_WARN_CONFLICTING_HINT),
+        (3127, ErrorKind::ER_WARN_UNKNOWN_QB_NAME),
+        (3128, ErrorKind::ER_UNRESOLVED_HINT_NAME),
+    ] {
+        assert_eq!(kind as u16, number);
+        assert_eq!(ErrorKind::from_code(number), Some(kind));
+        assert_eq!(ErrorKind::from(number), kind);
+        assert_eq!(kind.sqlstate(), b"HY000");
+    }
+    assert_eq!(ErrorKind::from_code(u16::MAX), None);
+}
+
+#[test]
+fn invalid_json_column_and_function_argument_text_keep_distinct_native_roundtrips() {
+    for (number, kind) in [
+        (3140, ErrorKind::ER_INVALID_JSON_TEXT),
+        (3141, ErrorKind::ER_INVALID_JSON_TEXT_IN_PARAM),
+    ] {
+        assert_eq!(kind as u16, number);
+        assert_eq!(ErrorKind::from_code(number), Some(kind));
+        assert_eq!(ErrorKind::from(number), kind);
+        assert_eq!(kind.sqlstate(), b"22032");
+    }
+    assert_ne!(
+        ErrorKind::ER_INVALID_JSON_TEXT,
+        ErrorKind::ER_INVALID_JSON_TEXT_IN_PARAM
+    );
+}
+#[test]
+fn mfa_and_functional_json_errors_keep_native_identity_and_state() {
+    let mfa = [
+        ErrorKind::ER_INVALID_MFA_PLUGIN_SPECIFIED,
+        ErrorKind::ER_IDENTIFIED_BY_UNSUPPORTED,
+        ErrorKind::ER_INVALID_PLUGIN_FOR_REGISTRATION,
+        ErrorKind::ER_PLUGIN_REQUIRES_REGISTRATION,
+        ErrorKind::ER_MFA_METHOD_EXISTS,
+        ErrorKind::ER_MFA_METHOD_NOT_EXISTS,
+        ErrorKind::ER_AUTHENTICATION_POLICY_MISMATCH,
+        ErrorKind::ER_PLUGIN_REGISTRATION_DONE,
+        ErrorKind::ER_INVALID_USER_FOR_REGISTRATION,
+        ErrorKind::ER_USER_REGISTRATION_FAILED,
+        ErrorKind::ER_MFA_METHODS_INVALID_ORDER,
+        ErrorKind::ER_MFA_METHODS_IDENTICAL,
+        ErrorKind::ER_INVALID_MFA_OPERATIONS_FOR_PASSWORDLESS_USER,
+    ];
+    for (offset, kind) in mfa.into_iter().enumerate() {
+        let number = 4052 + offset as u16;
+        assert_eq!(kind as u16, number);
+        assert_eq!(ErrorKind::from_code(number), Some(kind));
+        assert_eq!(ErrorKind::from(number), kind);
+        assert_eq!(kind.sqlstate(), b"HY000");
+    }
+    for (kind, number, state) in [
+        (
+            ErrorKind::ER_INVALID_JSON_VALUE_FOR_FUNC_INDEX,
+            3903,
+            b"22018",
+        ),
+        (
+            ErrorKind::ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX,
+            3904,
+            b"22003",
+        ),
+        (ErrorKind::ER_WRONG_MVI_VALUE, 3908, b"HY000"),
+    ] {
+        assert_eq!(kind as u16, number);
+        assert_eq!(ErrorKind::from_code(number), Some(kind));
+        assert_eq!(kind.sqlstate(), state);
+    }
+    assert_eq!(
+        ErrorKind::from_code(3140),
+        Some(ErrorKind::ER_INVALID_JSON_TEXT)
+    );
+    assert_eq!(
+        ErrorKind::from_code(3126),
+        Some(ErrorKind::ER_WARN_CONFLICTING_HINT)
+    );
+    assert_eq!(
+        ErrorKind::from_code(3127),
+        Some(ErrorKind::ER_WARN_UNKNOWN_QB_NAME)
+    );
+}

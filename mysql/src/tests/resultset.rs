@@ -657,6 +657,7 @@ async fn cursor_open_ok_preserves_warnings_and_session_state() {
                 session_state_info: vec![5, 2, 1, b'T'],
                 ..Default::default()
             },
+            true,
         )
         .await
         .unwrap();
@@ -727,4 +728,355 @@ async fn legacy_cursor_eof_preserves_status_and_warning_count() {
     let status = StatusFlags::from_bits_truncate(u16::from_le_bytes([payload[3], payload[4]]));
     assert!(status.contains(StatusFlags::SERVER_STATUS_IN_TRANS));
     assert!(status.contains(StatusFlags::SERVER_STATUS_CURSOR_EXISTS));
+}
+
+#[tokio::test]
+async fn optional_cursor_metadata_keeps_actual_binary_fetch_columns_and_one_terminator() {
+    for optional in [false, true] {
+        for full in [false, true] {
+            for deprecate in [false, true] {
+                for empty in [false, true] {
+                    let mut capabilities = CapabilityFlags::CLIENT_PROTOCOL_41;
+                    capabilities.set(
+                        CapabilityFlags::CLIENT_OPTIONAL_RESULTSET_METADATA,
+                        optional,
+                    );
+                    capabilities.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate);
+                    // NONE without the capability cannot pass the caller's
+                    // validated selector. Classic's actual SQL setter tests
+                    // cover that rejection rather than legalizing it here.
+                    let send_metadata = full || !optional;
+                    let mut columns = [progress_column(), progress_column()];
+                    columns[0].colflags |= ColumnFlags::NOT_NULL_FLAG;
+                    columns[1].column = b"raw".to_vec();
+                    columns[1].coltype = ColumnType::MYSQL_TYPE_VAR_STRING;
+                    let mut bytes = Vec::new();
+                    {
+                        let mut packets = PacketWriter::new(&mut bytes);
+                        QueryResultWriter::new(&mut packets, true, capabilities)
+                            .cursor_open(
+                                &columns,
+                                OkResponse {
+                                    status_flags: StatusFlags::SERVER_STATUS_IN_TRANS,
+                                    warnings: 2,
+                                    ..Default::default()
+                                },
+                                send_metadata,
+                            )
+                            .await
+                            .unwrap();
+                        let mut rows = QueryResultWriter::new(&mut packets, true, capabilities)
+                            .start_cursor_fetch(&columns)
+                            .await
+                            .unwrap();
+                        if !empty {
+                            rows.write_col(-7i32).unwrap();
+                            rows.write_col(b"a\0b".as_slice()).unwrap();
+                            rows.end_row().await.unwrap();
+                            rows.write_col(8i32).unwrap();
+                            rows.write_col(None::<&[u8]>).unwrap();
+                            rows.end_row().await.unwrap();
+                        }
+                        rows.finish_cursor(
+                            true,
+                            OkResponse {
+                                status_flags: StatusFlags::SERVER_STATUS_IN_TRANS,
+                                warnings: 3,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        packets.flush_all().await.unwrap();
+                    }
+                    let mut reader = crate::packet_reader::PacketReader::new(bytes.as_slice());
+                    let (sequence, count) = reader.next_async().await.unwrap().unwrap();
+                    assert_eq!(sequence, 0);
+                    let expected_count = if optional {
+                        vec![2, u8::from(send_metadata)]
+                    } else {
+                        vec![2]
+                    };
+                    assert_eq!(count.as_ref(), expected_count.as_slice());
+                    let mut sequence = 1;
+                    if send_metadata {
+                        for _ in &columns {
+                            let (actual, field) = reader.next_async().await.unwrap().unwrap();
+                            assert_eq!(actual, sequence);
+                            sequence += 1;
+                            assert_eq!(&field[..4], b"\x03def");
+                        }
+                    }
+                    for (last, warnings) in [(false, 2u16), (true, 3)] {
+                        if last && !empty {
+                            for expected in [
+                                [b"\0\0".as_slice(), &(-7i32).to_le_bytes(), b"\x03a\0b"].concat(),
+                                [b"\0\x08".as_slice(), &8i32.to_le_bytes()].concat(),
+                            ] {
+                                let (actual, row) = reader.next_async().await.unwrap().unwrap();
+                                assert_eq!(actual, sequence);
+                                sequence += 1;
+                                assert_eq!(
+                                    row.as_ref(),
+                                    expected.as_slice(),
+                                    "NONE never substitutes an empty encoder schema"
+                                );
+                            }
+                        }
+                        let (actual, end) = reader.next_async().await.unwrap().unwrap();
+                        assert_eq!(actual, sequence);
+                        sequence += 1;
+                        let status = StatusFlags::SERVER_STATUS_IN_TRANS
+                            | if last {
+                                StatusFlags::SERVER_STATUS_LAST_ROW_SENT
+                            } else {
+                                StatusFlags::SERVER_STATUS_CURSOR_EXISTS
+                            };
+                        let mut expected = if deprecate {
+                            vec![0xfe, 0, 0]
+                        } else {
+                            vec![0xfe]
+                        };
+                        if deprecate {
+                            expected.extend_from_slice(&status.bits().to_le_bytes());
+                            expected.extend_from_slice(&warnings.to_le_bytes());
+                        } else {
+                            expected.extend_from_slice(&warnings.to_le_bytes());
+                            expected.extend_from_slice(&status.bits().to_le_bytes());
+                        }
+                        assert_eq!(
+                            end.as_ref(),
+                            expected.as_slice(),
+                            "exactly one native cursor terminator"
+                        );
+                    }
+                    assert!(reader.next_async().await.unwrap().is_none());
+                    assert_eq!(columns.len(), 2);
+                    assert_eq!(columns[0].coltype, ColumnType::MYSQL_TYPE_LONG);
+                    assert_eq!(columns[1].coltype, ColumnType::MYSQL_TYPE_VAR_STRING);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn regular_materializing_sink_metadata_ends_in_bare_command_ok_under_every_metadata_and_eof_policy(
+) {
+    for optional in [false, true] {
+        for full in [false, true] {
+            for deprecate in [false, true] {
+                let mut capabilities = CapabilityFlags::CLIENT_PROTOCOL_41;
+                capabilities.set(
+                    CapabilityFlags::CLIENT_OPTIONAL_RESULTSET_METADATA,
+                    optional,
+                );
+                capabilities.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate);
+                let columns = [progress_column(), progress_column()];
+                let send_metadata = full || !optional;
+                let mut bytes = Vec::new();
+                {
+                    let mut packets = PacketWriter::new(&mut bytes);
+                    QueryResultWriter::new(&mut packets, true, capabilities)
+                        .materialized_result(
+                            &columns,
+                            OkResponse {
+                                status_flags: StatusFlags::SERVER_STATUS_AUTOCOMMIT
+                                    | StatusFlags::SERVER_STATUS_METADATA_CHANGED,
+                                warnings: 7,
+                                ..Default::default()
+                            },
+                            send_metadata,
+                        )
+                        .await
+                        .unwrap();
+                    packets.flush_all().await.unwrap();
+                }
+                let mut reader = crate::packet_reader::PacketReader::new(bytes.as_slice());
+                let (_, header) = reader.next_async().await.unwrap().unwrap();
+                assert_eq!(
+                    header.as_ref(),
+                    if optional {
+                        vec![2, u8::from(send_metadata)]
+                    } else {
+                        vec![2]
+                    }
+                );
+                if send_metadata {
+                    for _ in &columns {
+                        let (_, field) = reader.next_async().await.unwrap().unwrap();
+                        assert_eq!(&field[..4], b"\x03def");
+                    }
+                }
+                let (_, ack) = reader.next_async().await.unwrap().unwrap();
+                let status = StatusFlags::SERVER_STATUS_AUTOCOMMIT
+                    | StatusFlags::SERVER_STATUS_METADATA_CHANGED;
+                assert_eq!(
+                    ack.as_ref(),
+                    [
+                        vec![0, 0, 0],
+                        status.bits().to_le_bytes().to_vec(),
+                        7u16.to_le_bytes().to_vec()
+                    ]
+                    .concat()
+                );
+                assert!(!ok_status(&ack).intersects(
+                    StatusFlags::SERVER_STATUS_CURSOR_EXISTS
+                        | StatusFlags::SERVER_STATUS_LAST_ROW_SENT
+                ));
+                assert!(
+                    reader.next_async().await.unwrap().is_none(),
+                    "native metadata→bare OK, never metadata EOF/rows/extra EOF"
+                );
+                assert_eq!(
+                    columns.len(),
+                    2,
+                    "selector does not empty the actual row schema"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn binary_row_clear_retains_its_original_capacity_and_drop_releases_raw_bytes() {
+    use std::sync::{Arc, Mutex};
+    struct RowLease(Arc<Mutex<usize>>, usize);
+    impl Drop for RowLease {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() -= self.1;
+        }
+    }
+    let used = Arc::new(Mutex::new(0_usize));
+    let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let admission: crate::CommandAllocationAdmission = {
+        let used = Arc::clone(&used);
+        let denied = Arc::clone(&denied);
+        Arc::new(move |bytes| {
+            if denied.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::ErrorKind::OutOfMemory.into());
+            }
+            *used.lock().unwrap() += bytes;
+            Ok(Arc::new(RowLease(Arc::clone(&used), bytes)) as crate::CommandAllocation)
+        })
+    };
+    let mut output = Vec::new();
+    let mut packets = PacketWriter::new(&mut output);
+    packets.set_allocation_admission(Some(admission));
+    let mut column = progress_column();
+    column.coltype = ColumnType::MYSQL_TYPE_VAR_STRING;
+    column.colflags = ColumnFlags::empty();
+    let columns = [column];
+    let mut rows = QueryResultWriter::new(&mut packets, true, CapabilityFlags::CLIENT_PROTOCOL_41)
+        .start_without_metadata(&columns)
+        .await
+        .unwrap();
+    let baseline = *used.lock().unwrap();
+    rows.write_col(&b"\xff\0x"[..]).unwrap();
+    let before = *used.lock().unwrap();
+    assert!(before > baseline);
+    rows.end_row().await.unwrap();
+    let retained = *used.lock().unwrap();
+    assert!(retained > 0, "the physical row capacity survives clear");
+    rows.write_col(&b"\xff\0x"[..]).unwrap();
+    denied.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        rows.end_row().await.unwrap_err().kind(),
+        std::io::ErrorKind::OutOfMemory
+    );
+    drop(rows);
+    drop(packets);
+    assert_eq!(
+        *used.lock().unwrap(),
+        0,
+        "row and packet final Drop retire their same grants"
+    );
+    let mut reader = crate::packet_reader::PacketReader::new(output.as_slice());
+    let mut saw_raw = false;
+    while let Some((_, packet)) = reader.next_async().await.unwrap() {
+        saw_raw |= packet.as_ref() == [0, 0, 3, 0xff, 0, b'x'];
+    }
+    assert!(
+        saw_raw,
+        "the first successful actual binary row retains non-UTF8 and NUL"
+    );
+}
+
+#[tokio::test]
+async fn cursor_fetch_binary_rows_keep_the_original_buffer_admission_and_last_owner() {
+    use std::sync::{Arc, Mutex};
+
+    struct CursorLease(Arc<Mutex<usize>>, usize);
+    impl Drop for CursorLease {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() -= self.1;
+        }
+    }
+
+    for deprecate_eof in [false, true] {
+        for deny_growth in [false, true] {
+            let used = Arc::new(Mutex::new(0_usize));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let admission: crate::CommandAllocationAdmission = {
+                let used = Arc::clone(&used);
+                let calls = Arc::clone(&calls);
+                Arc::new(move |bytes| {
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Admit the original packet header, then specifically refuse
+                    // the independent binary row buffer's first allocation.
+                    if deny_growth && call != 0 {
+                        return Err(std::io::ErrorKind::OutOfMemory.into());
+                    }
+                    *used.lock().unwrap() += bytes;
+                    Ok(Arc::new(CursorLease(Arc::clone(&used), bytes))
+                        as crate::CommandAllocation)
+                })
+            };
+            let state = Arc::new(Mutex::new(ProgressState::default()));
+            let mut packets = PacketWriter::new(ProgressWriter(Arc::clone(&state)));
+            packets.set_allocation_admission(Some(admission));
+            let mut column = progress_column();
+            column.coltype = ColumnType::MYSQL_TYPE_VAR_STRING;
+            column.colflags = ColumnFlags::empty();
+            let columns = [column];
+            let mut capabilities = CapabilityFlags::CLIENT_PROTOCOL_41;
+            capabilities.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate_eof);
+            let mut rows = QueryResultWriter::new(&mut packets, true, capabilities)
+                .start_cursor_fetch(&columns)
+                .await
+                .unwrap();
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(state.lock().unwrap().buffered.is_empty());
+            if deny_growth {
+                assert_eq!(
+                    rows.write_col(&b"\xff\0x"[..]).unwrap_err().kind(),
+                    std::io::ErrorKind::OutOfMemory
+                );
+                assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+                drop(rows);
+                assert!(state.lock().unwrap().visible.is_empty());
+                assert!(state.lock().unwrap().buffered.is_empty());
+            } else {
+                rows.write_row([&b"\xff\0x"[..]]).await.unwrap();
+                assert!(*used.lock().unwrap() > 0);
+                rows.finish_cursor(true, OkResponse::default()).await.unwrap();
+                packets.flush_all().await.unwrap();
+                let emitted = visible_packets(&state);
+                assert_eq!(emitted.len(), 2, "fetch emits no column definitions");
+                assert_eq!(emitted[0], [0, 0, 3, 0xff, 0, b'x']);
+                let status = if deprecate_eof {
+                    ok_status(&emitted[1])
+                } else {
+                    StatusFlags::from_bits_truncate(u16::from_le_bytes([
+                        emitted[1][3],
+                        emitted[1][4],
+                    ]))
+                };
+                assert!(status.contains(StatusFlags::SERVER_STATUS_LAST_ROW_SENT));
+                assert!(!status.contains(StatusFlags::SERVER_STATUS_CURSOR_EXISTS));
+            }
+            drop(packets);
+            assert_eq!(*used.lock().unwrap(), 0, "last physical owner drops its grant");
+        }
+    }
 }

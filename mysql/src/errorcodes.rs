@@ -147,6 +147,8 @@ fn main() {
 pub enum ErrorKind {
     /// MySQL 8.0.46: user ATTRIBUTE must be a valid JSON object.
     ER_INVALID_USER_ATTRIBUTE_JSON = 3982,
+    ER_INVALID_JSON_ATTRIBUTE = 3980,
+    ER_ENGINE_ATTRIBUTE_NOT_SUPPORTED = 3981,
     /// hashchk
     ER_HASHCHK = 1000,
     /// isamchk
@@ -1929,6 +1931,8 @@ pub enum ErrorKind {
     ER_WARN_DEPRECATED_SQLMODE = 3090,
     /// Legacy SQL modes will be merged into strict mode.
     ER_SQL_MODE_MERGED = 3135,
+    /// Invalid JSON text supplied for a column value.
+    ER_INVALID_JSON_TEXT = 3140,
     /// Invalid JSON supplied to a function argument.
     ER_INVALID_JSON_TEXT_IN_PARAM = 3141,
     /// A JSON path is syntactically invalid.
@@ -1943,6 +1947,10 @@ pub enum ErrorKind {
     ER_JSON_VACUOUS_PATH = 3153,
     /// A JSON path quantifier must be `one` or `all`.
     ER_JSON_BAD_ONE_OR_ALL_ARG = 3154,
+    /// Conflicting or duplicated optimizer hint.
+    ER_WARN_CONFLICTING_HINT = 3126,
+    /// Optimizer hint refers to an unknown query-block name.
+    ER_WARN_UNKNOWN_QB_NAME = 3127,
     /// An optimizer instruction names no selected table or visible key.
     ER_UNRESOLVED_HINT_NAME = 3128,
     /// A numeric JSON value exceeds the range of the requested SQL type.
@@ -2173,12 +2181,60 @@ pub enum ErrorKind {
     ER_TOO_LONG_SET_ENUM_VALUE = 3505,
     /// An application cannot alter the protected dictionary schema.
     ER_NO_SYSTEM_SCHEMA_ACCESS = 3552,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_INVALID_JSON_VALUE_FOR_FUNC_INDEX = 3903,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX = 3904,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_WRONG_MVI_VALUE = 3908,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_INVALID_MFA_PLUGIN_SPECIFIED = 4052,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_IDENTIFIED_BY_UNSUPPORTED = 4053,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_INVALID_PLUGIN_FOR_REGISTRATION = 4054,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_PLUGIN_REQUIRES_REGISTRATION = 4055,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_MFA_METHOD_EXISTS = 4056,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_MFA_METHOD_NOT_EXISTS = 4057,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_AUTHENTICATION_POLICY_MISMATCH = 4058,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_PLUGIN_REGISTRATION_DONE = 4059,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_INVALID_USER_FOR_REGISTRATION = 4060,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_USER_REGISTRATION_FAILED = 4061,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_MFA_METHODS_INVALID_ORDER = 4062,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_MFA_METHODS_IDENTICAL = 4063,
+    /// Fixed MySQL 8.0.46 application condition.
+    ER_INVALID_MFA_OPERATIONS_FOR_PASSWORDLESS_USER = 4064,
 }
 
 impl ErrorKind {
     /// Resolve a known native error without rejecting valid user-defined codes.
     pub fn from_code(x: u16) -> Option<Self> {
         Some(match x {
+            3903_u16 => ErrorKind::ER_INVALID_JSON_VALUE_FOR_FUNC_INDEX,
+            3904_u16 => ErrorKind::ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX,
+            3908_u16 => ErrorKind::ER_WRONG_MVI_VALUE,
+            4052_u16 => ErrorKind::ER_INVALID_MFA_PLUGIN_SPECIFIED,
+            4053_u16 => ErrorKind::ER_IDENTIFIED_BY_UNSUPPORTED,
+            4054_u16 => ErrorKind::ER_INVALID_PLUGIN_FOR_REGISTRATION,
+            4055_u16 => ErrorKind::ER_PLUGIN_REQUIRES_REGISTRATION,
+            4056_u16 => ErrorKind::ER_MFA_METHOD_EXISTS,
+            4057_u16 => ErrorKind::ER_MFA_METHOD_NOT_EXISTS,
+            4058_u16 => ErrorKind::ER_AUTHENTICATION_POLICY_MISMATCH,
+            4059_u16 => ErrorKind::ER_PLUGIN_REGISTRATION_DONE,
+            4060_u16 => ErrorKind::ER_INVALID_USER_FOR_REGISTRATION,
+            4061_u16 => ErrorKind::ER_USER_REGISTRATION_FAILED,
+            4062_u16 => ErrorKind::ER_MFA_METHODS_INVALID_ORDER,
+            4063_u16 => ErrorKind::ER_MFA_METHODS_IDENTICAL,
+            4064_u16 => ErrorKind::ER_INVALID_MFA_OPERATIONS_FOR_PASSWORDLESS_USER,
             3751_u16 => ErrorKind::ER_WARN_DATA_TRUNCATED_FUNCTIONAL_INDEX,
             3752_u16 => ErrorKind::ER_WARN_DATA_OUT_OF_RANGE_FUNCTIONAL_INDEX,
             3754_u16 => ErrorKind::ER_FUNCTIONAL_INDEX_REF_AUTO_INCREMENT,
@@ -3082,6 +3138,7 @@ impl ErrorKind {
             3064_u16 => ErrorKind::ER_INCORRECT_TYPE,
             3090_u16 => ErrorKind::ER_WARN_DEPRECATED_SQLMODE,
             3135_u16 => ErrorKind::ER_SQL_MODE_MERGED,
+            3140_u16 => ErrorKind::ER_INVALID_JSON_TEXT,
             3141_u16 => ErrorKind::ER_INVALID_JSON_TEXT_IN_PARAM,
             3143_u16 => ErrorKind::ER_INVALID_JSON_PATH,
             3144_u16 => ErrorKind::ER_INVALID_JSON_CHARSET,
@@ -3092,6 +3149,8 @@ impl ErrorKind {
             3153_u16 => ErrorKind::ER_JSON_VACUOUS_PATH,
             3154_u16 => ErrorKind::ER_JSON_BAD_ONE_OR_ALL_ARG,
             3128_u16 => ErrorKind::ER_UNRESOLVED_HINT_NAME,
+            3126_u16 => ErrorKind::ER_WARN_CONFLICTING_HINT,
+            3127_u16 => ErrorKind::ER_WARN_UNKNOWN_QB_NAME,
             3155_u16 => ErrorKind::ER_NUMERIC_JSON_VALUE_OUT_OF_RANGE,
             3665_u16 => ErrorKind::ER_MISSING_JSON_TABLE_VALUE,
             3666_u16 => ErrorKind::ER_WRONG_JSON_TABLE_VALUE,
@@ -3194,6 +3253,8 @@ impl ErrorKind {
             4127_u16 => ErrorKind::ER_SRS_INVALID_LATITUDE_POLAR_STERE_VAR_A,
             3020_u16 => ErrorKind::ER_INVALID_ARGUMENT_FOR_LOGARITHM,
             3982_u16 => ErrorKind::ER_INVALID_USER_ATTRIBUTE_JSON,
+            3980_u16 => ErrorKind::ER_INVALID_JSON_ATTRIBUTE,
+            3981_u16 => ErrorKind::ER_ENGINE_ATTRIBUTE_NOT_SUPPORTED,
             3024_u16 => ErrorKind::ER_QUERY_TIMEOUT,
             3061_u16 => ErrorKind::ER_ILLEGAL_USER_VAR,
             _ => return None,
@@ -3227,6 +3288,25 @@ impl ErrorKind {
     /// See also https://mariadb.com/kb/en/library/sqlstate/
     pub fn sqlstate(self) -> &'static [u8; 5] {
         match self {
+            ErrorKind::ER_INVALID_JSON_VALUE_FOR_FUNC_INDEX => b"22018",
+            ErrorKind::ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX => b"22003",
+            ErrorKind::ER_WRONG_MVI_VALUE => b"HY000",
+            ErrorKind::ER_INVALID_MFA_PLUGIN_SPECIFIED => b"HY000",
+            ErrorKind::ER_IDENTIFIED_BY_UNSUPPORTED => b"HY000",
+            ErrorKind::ER_INVALID_PLUGIN_FOR_REGISTRATION => b"HY000",
+            ErrorKind::ER_PLUGIN_REQUIRES_REGISTRATION => b"HY000",
+            ErrorKind::ER_MFA_METHOD_EXISTS => b"HY000",
+            ErrorKind::ER_MFA_METHOD_NOT_EXISTS => b"HY000",
+            ErrorKind::ER_AUTHENTICATION_POLICY_MISMATCH => b"HY000",
+            ErrorKind::ER_PLUGIN_REGISTRATION_DONE => b"HY000",
+            ErrorKind::ER_INVALID_USER_FOR_REGISTRATION => b"HY000",
+            ErrorKind::ER_USER_REGISTRATION_FAILED => b"HY000",
+            ErrorKind::ER_MFA_METHODS_INVALID_ORDER => b"HY000",
+            ErrorKind::ER_MFA_METHODS_IDENTICAL => b"HY000",
+            ErrorKind::ER_INVALID_MFA_OPERATIONS_FOR_PASSWORDLESS_USER => b"HY000",
+            ErrorKind::ER_INVALID_JSON_ATTRIBUTE | ErrorKind::ER_ENGINE_ATTRIBUTE_NOT_SUPPORTED => {
+                b"HY000"
+            }
             ErrorKind::ER_WARN_DATA_TRUNCATED_FUNCTIONAL_INDEX => b"01000",
             ErrorKind::ER_WARN_DATA_OUT_OF_RANGE_FUNCTIONAL_INDEX => b"22003",
             ErrorKind::ER_FUNCTIONAL_INDEX_REF_AUTO_INCREMENT
@@ -3282,7 +3362,8 @@ impl ErrorKind {
             | ErrorKind::ER_WARN_DEPRECATED_SQLMODE
             | ErrorKind::ER_SQL_MODE_MERGED
             | ErrorKind::ER_ROLE_NOT_GRANTED => b"HY000",
-            ErrorKind::ER_INVALID_JSON_TEXT_IN_PARAM
+            ErrorKind::ER_INVALID_JSON_TEXT
+            | ErrorKind::ER_INVALID_JSON_TEXT_IN_PARAM
             | ErrorKind::ER_INVALID_JSON_CHARSET
             | ErrorKind::ER_INVALID_TYPE_FOR_JSON
             | ErrorKind::ER_JSON_DOCUMENT_TOO_DEEP
@@ -4208,6 +4289,8 @@ impl ErrorKind {
             | ErrorKind::ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP
             | ErrorKind::ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER => b"HY000",
             ErrorKind::ER_UNRESOLVED_HINT_NAME => b"HY000",
+            ErrorKind::ER_WARN_CONFLICTING_HINT => b"HY000",
+            ErrorKind::ER_WARN_UNKNOWN_QB_NAME => b"HY000",
             ErrorKind::ER_INVALID_ARGUMENT_FOR_LOGARITHM => b"2201E",
             ErrorKind::ER_INVALID_USER_ATTRIBUTE_JSON => b"HY000",
             ErrorKind::ER_USER_DOES_NOT_EXIST | ErrorKind::ER_USER_ALREADY_EXISTS => b"HY000",

@@ -32,14 +32,14 @@ pub async fn plain_run_with_options<B, R, W>(
     shim: B,
     writer: W,
     opts: IntermediaryOptions,
-    init_params: (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+    init_params: (ClientHandshake, u8, CapabilityFlags, bool, PacketReader<R>),
 ) -> Result<(), B::Error>
 where
     B: AsyncMysqlShim<W> + Send + Sync,
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
-    let (handshake, seq, client_capabilities, reader) = init_params;
+    let (handshake, seq, client_capabilities, uncompressed_allowed, reader) = init_params;
     let reader = PacketReader::new(reader);
     let writer = PacketWriter::new(writer);
 
@@ -54,6 +54,7 @@ where
         writer,
         zstd_compression_level: 3,
         secure_transport: false,
+        uncompressed_allowed,
     };
     if let Err(error) = mi.init_after_ssl(handshake, seq).await {
         let _ = mi.shim.on_disconnect().await;
@@ -80,14 +81,14 @@ pub async fn secure_run_with_options<B, R, W>(
     writer: W,
     opts: IntermediaryOptions,
     tls_config: Arc<ServerConfig>,
-    init_params: (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+    init_params: (ClientHandshake, u8, CapabilityFlags, bool, PacketReader<R>),
 ) -> Result<(), B::Error>
 where
     B: AsyncMysqlShim<WriteHalf<TlsStream<Duplex<PacketReader<R>, W>>>> + Send + Sync,
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
-    let (handshake, seq, client_capabilities, reader) = init_params;
+    let (handshake, seq, client_capabilities, uncompressed_allowed, reader) = init_params;
     let (reader, writer, session, peer_certificates) =
         switch_to_tls_session(tls_config, reader, writer).await?;
     shim.on_tls_session(session, &peer_certificates)?;
@@ -105,6 +106,7 @@ where
         writer,
         zstd_compression_level: 3,
         secure_transport: true,
+        uncompressed_allowed,
     };
     if let Err(error) = mi.init_after_ssl(handshake, seq).await {
         let _ = mi.shim.on_disconnect().await;

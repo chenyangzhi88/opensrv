@@ -14,7 +14,7 @@
 
 use crate::myc::constants::{CapabilityFlags, Command as CommandByte};
 
-type ConnectionAttributes = Vec<(Vec<u8>, Vec<u8>)>;
+type ConnectionAttributes = Vec<u8>;
 
 #[derive(Debug)]
 pub struct ClientHandshake {
@@ -183,28 +183,33 @@ pub fn client_handshake(
     }
 }
 
-fn parse_length_encoded_bytes(i: &[u8]) -> nom::IResult<&[u8], &[u8]> {
-    let (i, size) = read_length_encoded_number(i)?;
-    nom::bytes::complete::take(size)(i)
-}
-
 fn parse_connection_attrs(i: &[u8]) -> nom::IResult<&[u8], ConnectionAttributes> {
-    let (i, size) = read_length_encoded_number(i)?;
+    if i.first() == Some(&0xfb) {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    // Native net_field_length_ll's nine-byte branch also consumes 0xff.
+    let (i, size) = if i.first() == Some(&0xff) {
+        let (remaining, bytes) = nom::bytes::complete::take(8usize)(&i[1..])?;
+        (
+            remaining,
+            u64::from_le_bytes(bytes.try_into().expect("bounded lenenc field")),
+        )
+    } else {
+        read_length_encoded_number(i)?
+    };
     if size > 65_535 {
         return Err(nom::Err::Failure(nom::error::Error::new(
             i,
             nom::error::ErrorKind::TooLarge,
         )));
     }
-    let (remaining, mut attrs_bytes) = nom::bytes::complete::take(size)(i)?;
-    let mut attrs = Vec::new();
-    while !attrs_bytes.is_empty() {
-        let (rest, key) = parse_length_encoded_bytes(attrs_bytes)?;
-        let (rest, value) = parse_length_encoded_bytes(rest)?;
-        attrs.push((key.to_vec(), value.to_vec()));
-        attrs_bytes = rest;
-    }
-    Ok((remaining, attrs))
+    // Native authentication validates the outer blob only. Internal malformed
+    // lenenc fields are retained for the bounded PFS row reader.
+    let (remaining, attrs_bytes) = nom::bytes::complete::take(size)(i)?;
+    Ok((remaining, attrs_bytes.to_vec()))
 }
 
 fn read_length_encoded_number(i: &[u8]) -> nom::IResult<&[u8], u64> {

@@ -21,16 +21,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
-use mysql_async::prelude::*;
 use mysql_async::Opts;
+use mysql_async::prelude::*;
 use mysql_common as myc;
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, Column, ErrorKind, InitWriter,
     OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, U24_MAX,
 };
 use tokio::io::BufWriter;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
+use tokio::net::tcp::OwnedWriteHalf;
 
 async fn raw_auth_read_packet(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
     use tokio::io::AsyncReadExt;
@@ -377,12 +377,12 @@ impl AsyncMysqlShim<BufWriter<OwnedWriteHalf>> for InitCountingShim {
         username: &[u8],
         charset: u16,
         initial_handshake: bool,
-    ) -> &'static str {
+    ) -> Result<(&'static str, Option<&'static [u8]>), Self::Error> {
         self.names
             .lock()
             .unwrap()
             .push((username.to_vec(), charset, initial_handshake));
-        "mysql_native_password"
+        Ok(("mysql_native_password", None))
     }
     async fn on_change_user(
         &mut self,

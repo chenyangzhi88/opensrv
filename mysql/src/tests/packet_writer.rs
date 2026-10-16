@@ -187,3 +187,158 @@ async fn actual_write_retries_only_interrupted_and_preserves_partial_packet_pref
     );
     assert!(bytes.lock().unwrap().is_empty());
 }
+
+struct PacketCapacityLease {
+    ledger: Arc<Mutex<(usize, usize, usize, bool)>>,
+    bytes: usize,
+}
+
+impl Drop for PacketCapacityLease {
+    fn drop(&mut self) {
+        let mut ledger = self.ledger.lock().unwrap();
+        ledger.0 = ledger.0.checked_sub(self.bytes).unwrap();
+    }
+}
+
+fn packet_capacity_admission(
+    ledger: &Arc<Mutex<(usize, usize, usize, bool)>>,
+) -> crate::CommandAllocationAdmission {
+    let ledger = Arc::clone(ledger);
+    Arc::new(move |bytes| {
+        let mut state = ledger.lock().unwrap();
+        if state.3
+            || state
+                .0
+                .checked_add(bytes)
+                .is_none_or(|total| total > state.1)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "actual packet capacity refusal",
+            ));
+        }
+        state.0 += bytes;
+        state.2 = state.2.max(state.0);
+        drop(state);
+        Ok(Arc::new(PacketCapacityLease {
+            ledger: Arc::clone(&ledger),
+            bytes,
+        }) as crate::CommandAllocation)
+    })
+}
+
+#[test]
+fn same_packet_buffer_keeps_capacity_permit_across_clear_and_failed_replacement() {
+    let ledger = Arc::new(Mutex::new((0, 24, 0, false)));
+    let mut buffer = crate::packet_writer::PacketBuilder::with_admission(Some(
+        packet_capacity_admission(&ledger),
+    ));
+    buffer.write_all(b"original").unwrap();
+    assert_eq!(ledger.lock().unwrap().0, 8);
+    let original = buffer.as_slice().as_ptr();
+    ledger.lock().unwrap().1 = 23; // old 8 plus selected replacement 16 minus one
+    assert_eq!(
+        buffer.write(b"!").unwrap_err().kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert_eq!(buffer.as_slice(), b"original");
+    assert_eq!(buffer.as_slice().as_ptr(), original);
+    assert_eq!(
+        ledger.lock().unwrap().0,
+        8,
+        "failure preserves the old grant"
+    );
+    ledger.lock().unwrap().1 = 24;
+    buffer.write_all(b"!").unwrap();
+    assert_eq!(buffer.as_slice(), b"original!");
+    assert_eq!(ledger.lock().unwrap().0, 16);
+    assert_eq!(
+        ledger.lock().unwrap().2,
+        24,
+        "both allocations overlap before replacement"
+    );
+    buffer.clear();
+    assert!(buffer.as_slice().is_empty());
+    assert_eq!(
+        ledger.lock().unwrap().0,
+        16,
+        "clear does not release live capacity"
+    );
+    ledger.lock().unwrap().3 = true;
+    buffer.write_all(b"reuse").unwrap();
+    assert_eq!(
+        buffer.as_slice(),
+        b"reuse",
+        "no new allocation on capacity reuse"
+    );
+    assert_eq!(
+        buffer.reserve(usize::MAX).unwrap_err().kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert_eq!(buffer.as_slice(), b"reuse");
+    drop(buffer);
+    assert_eq!(ledger.lock().unwrap().0, 0);
+}
+
+#[tokio::test]
+async fn real_packet_transport_failure_and_cancel_retire_all_inflight_buffer_permits() {
+    for compression in [0, 1, 2] {
+        let ledger = Arc::new(Mutex::new((0, 1 << 20, 0, false)));
+        let state = Arc::new(Mutex::new(Vec::new()));
+        let output = InterruptWriter {
+            interrupts: 0,
+            interrupt_after_bytes: usize::MAX,
+            bytes: state,
+            pending: true,
+        };
+        let mut writer = PacketWriter::new(output);
+        writer.set_allocation_admission(Some(packet_capacity_admission(&ledger)));
+        if compression == 1 {
+            writer.enable_compression();
+        }
+        if compression == 2 {
+            writer.enable_zstd_compression(3);
+        }
+        writer.write_all(&[0xff, 0, b'x']).unwrap();
+        assert_eq!(ledger.lock().unwrap().0, 4);
+        {
+            let future = writer.end_packet();
+            futures::pin_mut!(future);
+            assert!(
+                futures::poll!(future.as_mut()).is_pending(),
+                "actual I/O is pending"
+            );
+            assert!(
+                ledger.lock().unwrap().0 > 4,
+                "framing and encoded buffers are also admitted"
+            );
+        }
+        assert_eq!(
+            ledger.lock().unwrap().0,
+            0,
+            "cancel retires the actual in-flight bytes"
+        );
+        writer.write_all(b"next").unwrap();
+        assert_eq!(
+            ledger.lock().unwrap().0,
+            4,
+            "same writer can own its next independent buffer"
+        );
+        drop(writer);
+        assert_eq!(ledger.lock().unwrap().0, 0);
+    }
+    let ledger = Arc::new(Mutex::new((0, 64, 0, false)));
+    let mut writer = PacketWriter::new(tokio::io::sink());
+    writer.set_allocation_admission(Some(packet_capacity_admission(&ledger)));
+    writer.write_all(b"raw").unwrap();
+    ledger.lock().unwrap().3 = true;
+    assert_eq!(
+        writer.end_packet().await.unwrap_err().kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert_eq!(
+        ledger.lock().unwrap().0,
+        0,
+        "framing refusal drops bytes before their grants"
+    );
+}

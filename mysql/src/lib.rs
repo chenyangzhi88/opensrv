@@ -240,7 +240,7 @@ pub use crate::params::{
 };
 pub use crate::resultset::{InitWriter, QueryResultWriter, RowWriter, StatementMetaWriter};
 pub use crate::value::{
-    decode::to_naive_datetime, MySqlTextValue, ToMysqlValue, Value, ValueInner,
+    MySqlTextValue, ToMysqlValue, Value, ValueInner, decode::to_naive_datetime,
 };
 use crate::{commands::ClientHandshake, packet_reader::PacketReader, packet_writer::PacketWriter};
 
@@ -402,8 +402,17 @@ pub trait AsyncMysqlShim<W: Send> {
         _user: &[u8],
         _character_set: u16,
         _initial_handshake: bool,
-    ) -> &'static str {
-        MYSQL_NATIVE_PASSWORD
+    ) -> Result<(&'static str, Option<&'static [u8]>), Self::Error> {
+        Ok((MYSQL_NATIVE_PASSWORD, None))
+    }
+
+    /// Advance only after the backend's current factor was actually accepted.
+    /// None preserves the original one-factor path; a returned empty plugin
+    /// is an installed server-only method which must fail without a challenge.
+    async fn next_authentication_factor(
+        &self,
+    ) -> Result<Option<(&'static str, &'static [u8])>, Self::Error> {
+        Ok(None)
     }
 
     /// Default salt(scramble) for auth plugin
@@ -547,6 +556,13 @@ pub trait AsyncMysqlShim<W: Send> {
         base
     }
 
+    /// Read the original connection policy once, at its actual greeting.
+    /// The returned compression bits and uncompressed permission belong to
+    /// that same handshake, even if the backend's GLOBAL value later changes.
+    fn handshake_capabilities(&self) -> Result<(CapabilityFlags, bool), Self::Error> {
+        Ok((self.server_capabilities(self.base_capabilities()), true))
+    }
+
     /// Opt-in only for a shim implementing the negotiated envelopes below.
     /// The returned permit must be issued by its actual process budget and
     /// remain live until the physical collection or source types are dropped.
@@ -554,26 +570,32 @@ pub trait AsyncMysqlShim<W: Send> {
         None
     }
 
+    /// Admit the actual result row/packet buffers before each capacity grows.
+    /// The physical buffer keeps the returned permit until it is dropped.
+    /// This does not negotiate or authorize query attributes.
+    fn result_allocation_admission(&self) -> Option<CommandAllocationAdmission> {
+        None
+    }
+
     /// Called after the client handshake has been parsed and before authentication completes.
     fn on_client_capabilities(
         &mut self,
         _capabilities: CapabilityFlags,
-        _connection_attrs: &[(String, String)],
-    ) {
-    }
-
-    /// Decodes one connection-attribute field after the client collation is
-    /// installed. Attribute bytes use the connection character set, not
-    /// necessarily UTF-8.
-    fn decode_connection_attribute(&self, value: &[u8]) -> String {
-        String::from_utf8_lossy(value).into_owned()
+        _connection_attrs: &[u8],
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     /// Called when COM_SET_OPTION changes a capability after authentication.
     fn on_client_capabilities_changed(&mut self, _capabilities: CapabilityFlags) {}
 
     /// Replaces connection attributes supplied by a successful COM_CHANGE_USER.
-    fn on_change_user_connection_attrs(&mut self, _connection_attrs: &[(String, String)]) {}
+    fn on_change_user_connection_attrs(
+        &mut self,
+        _connection_attrs: &[u8],
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Validates the actual packet charset before plugin selection. Initial
     /// authentication and COM_CHANGE_USER both call this read-only hook;
@@ -602,11 +624,6 @@ pub trait AsyncMysqlShim<W: Send> {
     /// 0 for an uncompressed connection and 6 for the classic zlib default.
     fn on_compression(&mut self, _algorithm: &'static str, _level: u8) {}
 
-    /// Lets a backend enforce its runtime protocol_compression_algorithms value.
-    fn accept_compression(&self, _algorithm: &str) -> bool {
-        true
-    }
-
     /// Called after authentication succeeds so session-visible identity follows the login user.
     fn on_authenticated_user(
         &mut self,
@@ -625,6 +642,7 @@ pub trait AsyncMysqlShim<W: Send> {
         _username: &[u8],
         _character_set: u16,
         _initial_handshake: bool,
+        _defer_identity_publication: bool,
     ) -> Option<(ErrorKind, String)> {
         None
     }
@@ -778,6 +796,24 @@ pub trait AsyncMysqlShim<W: Send> {
         query: &'a [u8],
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error>;
+
+    /// The actual COM_PROCESS_INFO packet. This is always the backend's
+    /// legacy short producer, never a SQL source or GLOBAL SHOW policy.
+    async fn on_process_info<'a>(
+        &'a mut self,
+        results: QueryResultWriter<'a, W>,
+    ) -> Result<(), Self::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        results
+            .error(
+                ErrorKind::ER_NOT_SUPPORTED_YET,
+                b"COM_PROCESS_INFO callback is not installed",
+            )
+            .await
+            .map_err(Self::Error::from)
+    }
 
     async fn on_query_bindings<'a>(
         &'a mut self,
@@ -966,7 +1002,7 @@ struct ChangeUserRequest<'a> {
     database: Option<&'a [u8]>,
     character_set: u16,
     plugin: Option<&'a str>,
-    connection_attrs: Vec<(Vec<u8>, Vec<u8>)>,
+    connection_attrs: &'a [u8],
 }
 
 fn parse_change_user_native<'a>(
@@ -1000,7 +1036,7 @@ fn parse_change_user_native<'a>(
         } else {
             None
         };
-        let mut connection_attrs = Vec::new();
+        let mut connection_attrs = &[][..];
         if capabilities.contains(CapabilityFlags::CLIENT_CONNECT_ATTRS) {
             // Native read_client_connect_attrs returns failure without setting DA.
             first_error = None;
@@ -1011,22 +1047,12 @@ fn parse_change_user_native<'a>(
                     "COM_CHANGE_USER connection attributes exceed 65535 bytes",
                 ));
             }
-            let (mut attributes, remaining) =
+            let (attributes, remaining) =
                 take_bytes(attributes, length, "COM_CHANGE_USER connection attributes")?;
             if !remaining.is_empty() {
                 return Err(invalid_data("COM_CHANGE_USER contains trailing bytes"));
             }
-            while !attributes.is_empty() {
-                let (key_length, tail) =
-                    read_lenenc_int(attributes, "COM_CHANGE_USER attribute key")?;
-                let (key, tail) = take_bytes(tail, key_length, "COM_CHANGE_USER attribute key")?;
-                let (value_length, tail) =
-                    read_lenenc_int(tail, "COM_CHANGE_USER attribute value")?;
-                let (value, tail) =
-                    take_bytes(tail, value_length, "COM_CHANGE_USER attribute value")?;
-                connection_attrs.push((key.to_vec(), value.to_vec()));
-                attributes = tail;
-            }
+            connection_attrs = attributes;
         } else if !rest.is_empty() {
             return Err(invalid_data("COM_CHANGE_USER contains trailing bytes"));
         }
@@ -1084,17 +1110,12 @@ fn read_lenenc_int<'a>(input: &'a [u8], field: &'static str) -> io::Result<(usiz
                 rest,
             )
         }
-        0xfe => {
+        0xfe | 0xff => {
             let (bytes, rest) = take_bytes(rest, 8, field)?;
             (
                 u64::from_le_bytes(bytes.try_into().expect("length checked above")),
                 rest,
             )
-        }
-        0xff => {
-            return Err(invalid_data(format!(
-                "{field} has an invalid length marker"
-            )));
         }
     };
     let value = usize::try_from(value)
@@ -1127,6 +1148,7 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     writer: packet_writer::PacketWriter<W>,
     zstd_compression_level: u8,
     secure_transport: bool,
+    uncompressed_allowed: bool,
 }
 
 /// Configuration used to craft the initial server handshake before a shim is available.
@@ -1137,6 +1159,7 @@ pub struct ServerHandshakeConfig {
     pub default_auth_plugin: String,
     pub scramble: [u8; SCRAMBLE_SIZE],
     pub server_capabilities: CapabilityFlags,
+    pub uncompressed_allowed: bool,
     pub collation: u8,
     pub status_flags: StatusFlags,
 }
@@ -1163,7 +1186,7 @@ where
     ) -> Result<(), B::Error> {
         let process_use_statement_on_query = opts.process_use_statement_on_query;
         let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
-        let (_, (handshake, seq, client_capabilities, input_stream)) =
+        let (_, (handshake, seq, client_capabilities, uncompressed_allowed, input_stream)) =
             AsyncMysqlIntermediary::init_before_ssl(
                 &mut shim,
                 input_stream,
@@ -1185,6 +1208,7 @@ where
             writer,
             zstd_compression_level: 0,
             secure_transport: false,
+            uncompressed_allowed,
         };
         if let Err(error) = mi.init_after_ssl(handshake, seq).await {
             let _ = mi.shim.on_disconnect().await;
@@ -1217,19 +1241,21 @@ where
     ) -> Result<
         (
             bool,
-            (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+            (ClientHandshake, u8, CapabilityFlags, bool, PacketReader<R>),
         ),
         B::Error,
     > {
+        let (capabilities, uncompressed_allowed) = shim.handshake_capabilities()?;
         let config = ServerHandshakeConfig {
             version: shim.version(),
             connection_id: shim.connect_id(),
             default_auth_plugin: shim.default_auth_plugin().to_string(),
             scramble: shim.salt(),
             server_capabilities: query_attribute_capabilities(
-                shim.server_capabilities(shim.base_capabilities()),
+                capabilities,
                 shim.query_attributes_admission().is_some(),
             ),
+            uncompressed_allowed,
             collation: shim.handshake_collation(),
             status_flags: shim.status_flags(),
         };
@@ -1252,7 +1278,7 @@ where
         #[cfg(feature = "tls")] tls_conf: &Option<std::sync::Arc<ServerConfig>>,
     ) -> io::Result<(
         bool,
-        (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
+        (ClientHandshake, u8, CapabilityFlags, bool, PacketReader<R>),
     )> {
         let mut reader = PacketReader::new(input_stream);
         let mut writer = PacketWriter::new(output_stream);
@@ -1265,14 +1291,17 @@ where
         // connection_id (4 bytes)
         writer.write_all(&config.connection_id.to_le_bytes())?;
 
-        let server_capabilities = config.server_capabilities;
-
+        let mut server_capabilities = config.server_capabilities;
+        // A backend bit is not a TLS context. Only this actual transport
+        // configuration may advertise or accept the SSLRequest transition.
+        server_capabilities.remove(CapabilityFlags::CLIENT_SSL);
         #[cfg(feature = "tls")]
-        let server_capabilities = if tls_conf.is_some() {
-            server_capabilities | CapabilityFlags::CLIENT_SSL
-        } else {
-            server_capabilities
-        };
+        let ssl_available = tls_conf.is_some();
+        #[cfg(not(feature = "tls"))]
+        let ssl_available = false;
+        if ssl_available {
+            server_capabilities.insert(CapabilityFlags::CLIENT_SSL);
+        }
 
         let server_capabilities_vec = server_capabilities.bits().to_le_bytes();
         let default_auth_plugin = config.default_auth_plugin.as_str();
@@ -1282,7 +1311,7 @@ where
         writer.write_all(&[0x00])?;
 
         writer.write_all(&server_capabilities_vec[..2])?; // The lower 2 bytes of the Capabilities Flags, 0x42
-                                                          // self.writer.write_all(&[0x00, 0x42])?;
+        // self.writer.write_all(&[0x00, 0x42])?;
         writer.write_all(&[config.collation])?;
         writer.write_all(&config.status_flags.bits().to_le_bytes())?;
         writer.write_all(&server_capabilities_vec[2..4])?; // The upper 2 bytes of the Capabilities Flags
@@ -1340,20 +1369,39 @@ where
 
         writer.set_seq(seq.wrapping_add(1));
 
-        #[cfg(not(feature = "tls"))]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "client requested SSL despite us not advertising support for it",
+            if !ssl_available {
+                writers::write_err(ErrorKind::ER_HANDSHAKE_ERROR, b"Bad handshake", &mut writer)
+                    .await?;
+                writer.flush_all().await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "client requested SSL without an actual TLS context",
+                )
+                .into());
+            }
+            return Ok((
+                true,
+                (
+                    handshake,
+                    seq,
+                    server_capabilities,
+                    config.uncompressed_allowed,
+                    reader,
+                ),
             ));
         }
 
-        #[cfg(feature = "tls")]
-        if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
-            return Ok((true, (handshake, seq, server_capabilities, reader)));
-        }
-
-        Ok((false, (handshake, seq, server_capabilities, reader)))
+        Ok((
+            false,
+            (
+                handshake,
+                seq,
+                server_capabilities,
+                config.uncompressed_allowed,
+                reader,
+            ),
+        ))
     }
 
     pub async fn init_after_ssl(
@@ -1365,6 +1413,23 @@ where
         let settings = self.shim.network_settings();
         self.reader.set_network_settings(settings.clone());
         self.writer.set_network_settings(settings);
+        self.writer
+            .set_allocation_admission(self.shim.result_allocation_admission());
+        if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) && !self.secure_transport {
+            self.writer.set_seq(seq.wrapping_add(1));
+            writers::write_err(
+                ErrorKind::ER_HANDSHAKE_ERROR,
+                b"Bad handshake",
+                &mut self.writer,
+            )
+            .await?;
+            self.writer.flush_all().await?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSLRequest did not enter the actual TLS transport",
+            )
+            .into());
+        }
         #[cfg(feature = "tls")]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
             let (_seq, hs) = self
@@ -1440,18 +1505,8 @@ where
                 client_collation.charset,
                 client_collation.collation,
             )?;
-            let connection_attrs = handshake
-                .connection_attrs
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        self.shim.decode_connection_attribute(key),
-                        self.shim.decode_connection_attribute(value),
-                    )
-                })
-                .collect::<Vec<_>>();
             self.shim
-                .on_client_capabilities(negotiated_capabilities, connection_attrs.as_slice());
+                .on_client_capabilities(negotiated_capabilities, &handshake.connection_attrs)?;
             self.reader
                 .set_max_allowed_packet(self.shim.max_allowed_packet());
             let (compression_algorithm, compression_level) = if negotiated_capabilities
@@ -1480,11 +1535,25 @@ where
             } else {
                 ("", 0)
             };
+            // Native parses compression before the authentication plugin
+            // completes. A rejected choice cannot publish an authenticated
+            // identity, an account lease, or selected compression facts.
+            if compression_algorithm.is_empty() && !self.uncompressed_allowed {
+                let message = "Invalid compression algorithm 'uncompressed'.";
+                writers::write_err(
+                    ErrorKind::ER_WRONG_COMPRESSION_ALGORITHM_CLIENT,
+                    message.as_bytes(),
+                    &mut self.writer,
+                )
+                .await?;
+                self.writer.flush_all().await?;
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, message).into());
+            }
             self.shim
                 .on_compression(compression_algorithm, compression_level);
             if let Some(username) = &handshake.username {
                 let client_plugin = std::str::from_utf8(&handshake.auth_plugin).ok();
-                let (authenticated, auth_seq, used_password) = self
+                let exchange = self
                     .authenticate_exchange(
                         username,
                         handshake.collation,
@@ -1493,7 +1562,20 @@ where
                         &scramble,
                         (seq, &handshake.auth_response),
                     )
-                    .await?;
+                    .await;
+                let (authenticated, auth_seq, used_password) = match exchange {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.apply_authentication_result(
+                            username,
+                            handshake.collation,
+                            true,
+                            false,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
                 let authenticated = self
                     .apply_authentication_result(username, handshake.collation, true, authenticated)
                     .await;
@@ -1508,42 +1590,32 @@ where
                         true,
                         password_marker,
                     );
-                    writers::write_err(
-                        ErrorKind::ER_ACCESS_DENIED_ERROR,
-                        err_msg.as_bytes(),
-                        &mut self.writer,
-                    )
-                    .await?;
+                    if let Some((code, state, message)) = self.shim.authentication_error_response()
+                    {
+                        writers::write_err_raw(code, &state, message.as_bytes(), &mut self.writer)
+                            .await?;
+                    } else {
+                        writers::write_err(
+                            ErrorKind::ER_ACCESS_DENIED_ERROR,
+                            err_msg.as_bytes(),
+                            &mut self.writer,
+                        )
+                        .await?;
+                    }
                     self.writer.flush_all().await?;
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg).into());
                 }
                 self.shim
                     .on_authenticated_user(username, handshake.collation, true);
 
-                // MySQL reports an invalid uncompressed choice as an
-                // authorization-phase ERR packet.  Perform this check after
-                // the selected authentication plugin has completed so both
-                // command-line and mysqltest clients consume error 3922.
-                if !self.shim.accept_compression(compression_algorithm) {
-                    let display_algorithm = if compression_algorithm.is_empty() {
-                        "uncompressed"
-                    } else {
-                        compression_algorithm
-                    };
-                    let message = format!("Invalid compression algorithm '{display_algorithm}'.");
-                    writers::write_err(
-                        ErrorKind::ER_WRONG_COMPRESSION_ALGORITHM_CLIENT,
-                        message.as_bytes(),
-                        &mut self.writer,
-                    )
-                    .await?;
-                    self.writer.flush_all().await?;
-                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, message).into());
-                }
-
                 if let Some((kind, message)) = self
                     .shim
-                    .authenticated_user_admission_error(username, handshake.collation, true)
+                    .authenticated_user_admission_error(
+                        username,
+                        handshake.collation,
+                        true,
+                        handshake.db.is_some() || self.reject_connection_on_dbname_absence,
+                    )
                     .await
                 {
                     writers::write_err(kind, message.as_bytes(), &mut self.writer).await?;
@@ -1611,10 +1683,10 @@ where
         initial_packet: (u8, &[u8]),
     ) -> Result<(bool, u8, bool), B::Error> {
         let (mut seq, initial_response) = initial_packet;
-        let expected = self
+        let (expected, initial_data) = self
             .shim
             .auth_plugin_for_username(username, character_set, initial_handshake)
-            .await;
+            .await?;
         let mut response = initial_response.to_vec();
         let mut used_password = auth_response_uses_password(&response);
         let caching_sha2 = if expected == "caching_sha2_password" {
@@ -1666,14 +1738,19 @@ where
         let needs_empty_response_switch = response.is_empty()
             && client_plugin == Some(expected)
             && (caching_sha2.is_some() || sha256.is_some());
-        if !expected.is_empty() && (client_plugin != Some(expected) || needs_empty_response_switch)
+        if !expected.is_empty()
+            && (client_plugin != Some(expected)
+                || needs_empty_response_switch
+                || initial_data.is_some_and(|data| !data.is_empty()))
         {
             self.writer.set_seq(seq.wrapping_add(1));
             self.writer.write_all(&[0xfe])?;
             self.writer.write_all(expected.as_bytes())?;
             self.writer.write_all(&[0x00])?;
-            self.writer.write_all(salt)?;
-            self.writer.write_all(&[0x00])?;
+            self.writer.write_all(initial_data.unwrap_or(salt))?;
+            if initial_data.is_none() {
+                self.writer.write_all(&[0x00])?;
+            }
             self.writer.end_packet().await?;
             self.writer.flush_all().await?;
             let (response_seq, switched_response) = self
@@ -1865,7 +1942,71 @@ where
                     )
                     .await
             };
-        Ok((authenticated, seq, used_password))
+        // The registered packet-reading test/cleartext handler sets YES once
+        // its real reply reached it, even for an empty or wrong reply. An IO
+        // failure above never reaches this frontier.
+        if initial_data.is_some() {
+            used_password = true;
+        }
+        if !authenticated {
+            return Ok((false, seq, used_password));
+        }
+        // The same backend attempt carries the accepted prefix. Neither the
+        // ordinal nor this capability bit creates credential authority.
+        for _ in 0..2 {
+            let Some((plugin, prompt)) = self.shim.next_authentication_factor().await? else {
+                return Ok((true, seq, used_password));
+            };
+            if !self
+                .client_capabilities
+                .contains(CapabilityFlags::CLIENT_PLUGIN_AUTH)
+                || !self
+                    .client_capabilities
+                    .contains(CapabilityFlags::MULTI_FACTOR_AUTHENTICATION)
+                || plugin.is_empty()
+            {
+                return Ok((false, seq, used_password));
+            }
+            // The previous response has already been consumed by its handler;
+            // only the new packet is borrowed by the next handler.
+            self.writer.set_seq(seq.wrapping_add(1));
+            self.writer.write_all(&[0x02])?;
+            self.writer.write_all(plugin.as_bytes())?;
+            self.writer.write_all(&[0x00])?;
+            self.writer.write_all(prompt)?;
+            self.writer.end_packet().await?;
+            self.writer.flush_all().await?;
+            let (response_seq, response) = self
+                .reader
+                .next_async_in_exchange(self.writer.sequence())
+                .await?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "peer terminated next-factor authentication",
+                    )
+                })?;
+            seq = response_seq;
+            self.writer
+                .set_compressed_sequence(self.reader.compressed_sequence());
+            // Both currently installed external handlers issue PASSWORD_USED_YES.
+            used_password = true;
+            if !self
+                .shim
+                .authenticate(
+                    plugin,
+                    username,
+                    character_set,
+                    initial_handshake,
+                    salt,
+                    &response,
+                )
+                .await
+            {
+                return Ok((false, seq, used_password));
+            }
+        }
+        Ok((true, seq, used_password))
     }
 
     async fn apply_authentication_result(
@@ -2240,12 +2381,25 @@ where
                             }
                         }
                         Command::ProcessInfo => {
-                            self.run_query_until_disconnect(
-                                b"SHOW PROCESSLIST /* COM_PROCESS_INFO */",
-                                false,
-                            )
-                            .await?;
-                            command_started = false;
+                            let outcome = {
+                                let results = QueryResultWriter::new(
+                                    &mut self.writer,
+                                    false,
+                                    self.client_capabilities,
+                                );
+                                poll_command_response(
+                                    &mut self.reader,
+                                    self.shim.on_process_info(results),
+                                    "peer terminated connection while process information was running",
+                                ).await
+                            };
+                            match outcome {
+                                CommandResponseOutcome::Completed(result) => result?,
+                                CommandResponseOutcome::Peer(error) => {
+                                    self.shim.on_query_cancelled().await?;
+                                    return Err(error.into());
+                                }
+                            }
                         }
                         Command::ProcessKill(connection_id) => {
                             self.run_query_until_disconnect(
@@ -2561,7 +2715,7 @@ where
                                 break;
                             }
                             let salt = self.shim.salt();
-                            let (authenticated, auth_seq, used_password) = self
+                            let exchange = self
                                 .authenticate_exchange(
                                     request.username,
                                     request.character_set,
@@ -2570,7 +2724,20 @@ where
                                     &salt,
                                     (seq, request.auth_data),
                                 )
-                                .await?;
+                                .await;
+                            let (authenticated, auth_seq, used_password) = match exchange {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    self.apply_authentication_result(
+                                        request.username,
+                                        request.character_set,
+                                        false,
+                                        false,
+                                    )
+                                    .await;
+                                    return Err(error);
+                                }
+                            };
                             let authenticated = self
                                 .apply_authentication_result(
                                     request.username,
@@ -2656,17 +2823,8 @@ where
                                 self.writer.flush_all().await?;
                                 break;
                             } else {
-                                let connection_attrs = request
-                                    .connection_attrs
-                                    .iter()
-                                    .map(|(key, value)| {
-                                        (
-                                            self.shim.decode_connection_attribute(key),
-                                            self.shim.decode_connection_attribute(value),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
-                                self.shim.on_change_user_connection_attrs(&connection_attrs);
+                                self.shim
+                                    .on_change_user_connection_attrs(request.connection_attrs)?;
                                 writers::write_ok_packet(
                                     &mut self.writer,
                                     self.client_capabilities,
