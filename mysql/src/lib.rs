@@ -970,8 +970,9 @@ pub trait AsyncMysqlShim<W: Send> {
 
 #[derive(Clone, Debug)]
 pub struct CachingSha2PasswordAuth {
-    pub public_key_pem: String,
-    pub private_key_pem: String,
+    /// Borrow the process-owned (private, public) PEM pair only when the
+    /// exchange actually sends a public key or decrypts an RSA response.
+    pub rsa_keys: fn() -> (&'static str, &'static str),
     /// Skip the cached verifier and exercise the full cleartext/TLS or RSA exchange.
     /// This is primarily useful for deterministic protocol conformance tests.
     pub force_full_auth: bool,
@@ -1842,11 +1843,13 @@ where
                     seq = response_seq;
                     self.writer
                         .set_compressed_sequence(self.reader.compressed_sequence());
+                    let mut rsa_keys = None;
                     let full_response = if full_response.as_ref() == [0x02] {
+                        let keys = (caching_sha2.rsa_keys)();
+                        rsa_keys = Some(keys);
                         self.writer.set_seq(seq.wrapping_add(1));
                         self.writer.write_all(&[0x01])?;
-                        self.writer
-                            .write_all(caching_sha2.public_key_pem.as_bytes())?;
+                        self.writer.write_all(keys.1.as_bytes())?;
                         self.writer.end_packet().await?;
                         self.writer.flush_all().await?;
                         let (encrypted_seq, encrypted) = self
@@ -1868,7 +1871,7 @@ where
                     };
                     used_password |= full_response.len() > 1;
                     let candidate = decode_caching_sha2_full_auth(
-                        &caching_sha2.private_key_pem,
+                        || rsa_keys.unwrap_or_else(|| (caching_sha2.rsa_keys)()).0,
                         salt,
                         &full_response,
                         self.secure_transport,
@@ -1889,8 +1892,11 @@ where
                     }
                 }
             } else if let Some(sha256) = sha256 {
+                let mut rsa_keys = None;
                 let full_response = if response.as_slice() == [0x01] {
-                    self.writer.write_all(sha256.public_key_pem.as_bytes())?;
+                    let keys = (sha256.rsa_keys)();
+                    rsa_keys = Some(keys);
+                    self.writer.write_all(keys.1.as_bytes())?;
                     self.writer.end_packet().await?;
                     self.writer.flush_all().await?;
                     let (encrypted_seq, encrypted) = self
@@ -1912,7 +1918,7 @@ where
                 };
                 used_password |= auth_response_uses_password(&full_response);
                 match decode_caching_sha2_full_auth(
-                    &sha256.private_key_pem,
+                    || rsa_keys.unwrap_or_else(|| (sha256.rsa_keys)()).0,
                     salt,
                     &full_response,
                     self.secure_transport,
@@ -3092,8 +3098,8 @@ fn auth_response_uses_password(response: &[u8]) -> bool {
     !response.is_empty() && response != [0]
 }
 
-fn decode_caching_sha2_full_auth(
-    private_key_pem: &str,
+fn decode_caching_sha2_full_auth<'key>(
+    private_key_pem: impl FnOnce() -> &'key str,
     salt: &[u8],
     response: &[u8],
     secure_transport: bool,
@@ -3103,6 +3109,9 @@ fn decode_caching_sha2_full_auth(
     }
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
+    // TLS cleartext does not borrow or initialize RSA state. Every other
+    // path retains its original RSA decoding and rejection behavior.
+    let private_key_pem = private_key_pem();
     let Ok(private_key) = rsa::RsaPrivateKey::from_pkcs8_pem(private_key_pem)
         .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(private_key_pem))
     else {

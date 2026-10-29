@@ -1021,10 +1021,10 @@ async fn cursor_fetch_binary_rows_keep_the_original_buffer_admission_and_last_ow
                 let used = Arc::clone(&used);
                 let calls = Arc::clone(&calls);
                 Arc::new(move |bytes| {
-                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Admit the original packet header, then specifically refuse
-                    // the independent binary row buffer's first allocation.
-                    if deny_growth && call != 0 {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The row buffer is admitted before the deferred packet
+                    // prefix. Refuse its first allocation, before any NET write.
+                    if deny_growth {
                         return Err(std::io::ErrorKind::OutOfMemory.into());
                     }
                     *used.lock().unwrap() += bytes;
@@ -1052,7 +1052,8 @@ async fn cursor_fetch_binary_rows_keep_the_original_buffer_admission_and_last_ow
                     rows.write_col(&b"\xff\0x"[..]).unwrap_err().kind(),
                     std::io::ErrorKind::OutOfMemory
                 );
-                assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+                assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+                assert_eq!(*used.lock().unwrap(), 0);
                 drop(rows);
                 assert!(state.lock().unwrap().visible.is_empty());
                 assert!(state.lock().unwrap().buffered.is_empty());
@@ -1078,5 +1079,131 @@ async fn cursor_fetch_binary_rows_keep_the_original_buffer_admission_and_last_ow
             drop(packets);
             assert_eq!(*used.lock().unwrap(), 0, "last physical owner drops its grant");
         }
+    }
+}
+
+
+#[tokio::test]
+async fn binary_rows_read_live_network_settings_after_the_synchronous_row_borrow() {
+    use std::sync::{Arc, Mutex};
+
+    for cursor in [false, true] {
+        for deprecate in [false, true] {
+            let state = Arc::new(Mutex::new(ProgressState::default()));
+            let minimum = Arc::new(Mutex::new(64usize));
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let mut packets = PacketWriter::new(ProgressWriter(Arc::clone(&state)));
+            packets.set_network_settings(Some({
+                let minimum = Arc::clone(&minimum);
+                let reads = Arc::clone(&reads);
+                Arc::new(move || {
+                    let current = *minimum.try_lock().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "NET settings reentered the synchronous row borrower",
+                        )
+                    })?;
+                    reads.lock().unwrap().push(current);
+                    Ok(crate::NetworkSettingsSnapshot {
+                        buffer_length: current,
+                        read_timeout: std::time::Duration::from_secs(1),
+                        write_timeout: std::time::Duration::from_secs(1),
+                        retry_count: 3,
+                    })
+                })
+            }));
+            let mut columns = [progress_column(), progress_column()];
+            columns[0].colflags |= ColumnFlags::NOT_NULL_FLAG;
+            columns[1].coltype = ColumnType::MYSQL_TYPE_VAR_STRING;
+            columns[1].colflags = ColumnFlags::empty();
+            let mut capabilities = CapabilityFlags::CLIENT_PROTOCOL_41;
+            capabilities.set(CapabilityFlags::CLIENT_DEPRECATE_EOF, deprecate);
+            let result = QueryResultWriter::new(&mut packets, true, capabilities);
+            let mut rows = if cursor {
+                result.start_cursor_fetch(&columns).await.unwrap()
+            } else {
+                result.start(&columns).await.unwrap()
+            };
+            reads.lock().unwrap().clear();
+            {
+                // This is the same nonreentrant-lock shape as the actual
+                // cursor row loan and live NET-variable callback.
+                let mut loan = minimum.lock().unwrap();
+                rows.write_col(7i32).unwrap();
+                rows.write_col(&b"\xff\0x"[..]).unwrap();
+                assert!(reads.lock().unwrap().is_empty());
+                *loan = 128;
+            }
+            rows.end_row().await.unwrap();
+            assert!(!reads.lock().unwrap().is_empty());
+            assert!(reads.lock().unwrap().iter().all(|value| *value == 128),
+                "the original live callback must observe the current policy, not an encode-time cache");
+            reads.lock().unwrap().clear();
+            {
+                let mut loan = minimum.lock().unwrap();
+                rows.write_col(8i32).unwrap();
+                rows.write_col(None::<&[u8]>).unwrap();
+                assert!(reads.lock().unwrap().is_empty());
+                *loan = 256;
+            }
+            rows.end_row().await.unwrap();
+            assert!(!reads.lock().unwrap().is_empty());
+            assert!(reads.lock().unwrap().iter().all(|value| *value == 256));
+            if cursor {
+                rows.finish_cursor(true, OkResponse::default()).await.unwrap();
+            } else {
+                rows.finish().await.unwrap();
+            }
+            packets.flush_all().await.unwrap();
+            let emitted = visible_packets(&state);
+            let first = if cursor { 0 } else if deprecate { 3 } else { 4 };
+            assert_eq!(emitted.len(), first + 3);
+            assert_eq!(emitted[first], [0, 0, 7, 0, 0, 0, 3, 0xff, 0, b'x']);
+            assert_eq!(emitted[first + 1], [0, 8, 8, 0, 0, 0]);
+            let terminal = &emitted[first + 2];
+            assert_eq!(terminal[0], 0xfe);
+            let status = if deprecate {
+                ok_status(terminal)
+            } else {
+                StatusFlags::from_bits_truncate(u16::from_le_bytes([terminal[3], terminal[4]]))
+            };
+            assert!(!status.contains(StatusFlags::SERVER_STATUS_CURSOR_EXISTS));
+            assert_eq!(status.contains(StatusFlags::SERVER_STATUS_LAST_ROW_SENT), cursor);
+        }
+    }
+}
+
+#[tokio::test]
+async fn refused_or_abandoned_binary_rows_do_not_enter_the_live_network_callback() {
+    use std::sync::{Arc, Mutex};
+
+    for rejected in [false, true] {
+        let state = Arc::new(Mutex::new(ProgressState::default()));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut packets = PacketWriter::new(ProgressWriter(Arc::clone(&state)));
+        packets.set_network_settings(Some({
+            let reads = Arc::clone(&reads);
+            Arc::new(move || {
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted,
+                    "this row must not reach transport policy"))
+            })
+        }));
+        let mut column = progress_column();
+        column.colflags |= ColumnFlags::NOT_NULL_FLAG;
+        let columns = [column];
+        let mut rows = QueryResultWriter::new(&mut packets, true, CapabilityFlags::CLIENT_PROTOCOL_41)
+            .start_cursor_fetch(&columns).await.unwrap();
+        if rejected {
+            assert_eq!(rows.write_col(None::<i32>).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData);
+        } else {
+            rows.write_col(7i32).unwrap();
+        }
+        drop(rows);
+        drop(packets);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(state.lock().unwrap().visible.is_empty());
+        assert!(state.lock().unwrap().buffered.is_empty());
     }
 }

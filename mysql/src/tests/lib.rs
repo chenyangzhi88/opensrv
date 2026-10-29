@@ -276,7 +276,7 @@ async fn initial_database_rejection_flushes_one_error_closes_and_never_dispatche
 
 #[tokio::test]
 async fn original_admission_defers_only_for_the_actual_pending_initial_database_frontier() {
-    for (has_database, requires_database) in [(false, false), (true, false), (false, true)] {
+    for (has_database, requires_database) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
             | CapabilityFlags::CLIENT_PLUGIN_AUTH
             | CapabilityFlags::CLIENT_SECURE_CONNECTION;
@@ -296,6 +296,9 @@ async fn original_admission_defers_only_for_the_actual_pending_initial_database_
         let shim = FrontierShim::default();
         let deferred = shim.deferred_identity.clone();
         let databases = shim.init_databases.clone();
+        let initializations = shim.initialization_calls.clone();
+        let read_calls = shim.read_calls.clone();
+        let commands = shim.command_frontiers.clone();
         let mut output = Vec::new();
         let mut intermediary = AsyncMysqlIntermediary {
             client_capabilities: capabilities,
@@ -308,18 +311,37 @@ async fn original_admission_defers_only_for_the_actual_pending_initial_database_
             secure_transport: false,
             uncompressed_allowed: true,
         };
-        intermediary.init_after_ssl(handshake, 1).await.unwrap();
+        let result = intermediary.init_after_ssl(handshake, 1).await;
+        let rejected = requires_database && !has_database;
+        if rejected {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        } else {
+            result.unwrap();
+        }
         assert_eq!(
             &*deferred.lock().unwrap(),
             &[has_database || requires_database]
         );
         assert_eq!(
-            databases.lock().unwrap().len(),
-            usize::from(has_database || requires_database)
+            &*databases.lock().unwrap(),
+            &if has_database { vec![b"db".to_vec()] } else { vec![] },
+            "a required but absent database is rejected before calling on_initial_database"
         );
+        assert_eq!(initializations.load(Ordering::SeqCst), 0);
+        assert_eq!(read_calls.load(Ordering::SeqCst), 0);
+        assert!(commands.lock().unwrap().is_empty());
         drop(intermediary);
         let mut reader = PacketReader::new(output.as_slice());
-        assert_eq!(reader.next_async().await.unwrap().unwrap().1[0], 0);
+        let (sequence, terminal) = reader.next_async().await.unwrap().unwrap();
+        assert_eq!(sequence, 2);
+        if rejected {
+            assert_eq!(terminal[0], 0xff);
+            assert_eq!(u16::from_le_bytes(terminal[1..3].try_into().unwrap()), 1631);
+            assert_eq!(&terminal[3..9], b"#HY000");
+            assert_eq!(&terminal[9..], b"database required on connection");
+        } else {
+            assert_eq!(terminal[0], 0);
+        }
         assert!(
             reader.next_async().await.unwrap().is_none(),
             "the same original branch emits one terminal, never an extra OK"

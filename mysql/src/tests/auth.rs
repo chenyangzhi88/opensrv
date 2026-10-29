@@ -86,11 +86,14 @@ async fn original_sha2_switch_and_full_auth_keep_the_same_packet_charset() {
 #[test]
 fn cleartext_full_auth_candidate_is_transient_and_nul_terminated() {
     assert_eq!(
-        decode_caching_sha2_full_auth("unused", b"nonce", b"secret\0", true),
+        decode_caching_sha2_full_auth(
+            || panic!("TLS cleartext must not borrow RSA keys"),
+            b"nonce", b"secret\0", true,
+        ),
         Some(b"secret".to_vec())
     );
     assert_eq!(
-        decode_caching_sha2_full_auth("unused", b"nonce", b"secret", true),
+        decode_caching_sha2_full_auth(|| "unused", b"nonce", b"secret", true),
         None
     );
 }
@@ -98,19 +101,33 @@ fn cleartext_full_auth_candidate_is_transient_and_nul_terminated() {
 #[test]
 fn insecure_transport_never_accepts_cleartext_full_auth() {
     assert_eq!(
-        decode_caching_sha2_full_auth("unused", b"nonce", b"secret\0", false),
+        decode_caching_sha2_full_auth(|| "unused", b"nonce", b"secret\0", false),
         None
     );
 }
 
+fn rsa_authentication_keys() -> (&'static str, &'static str) {
+    use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
+    const PRIVATE: &str = include_str!("../../tests/ssl/server.key");
+    static PUBLIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let public = PUBLIC.get_or_init(|| {
+        rsa::RsaPrivateKey::from_pkcs8_pem(PRIVATE)
+            .unwrap()
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap()
+    });
+    (PRIVATE, public.as_str())
+}
+
 #[test]
 fn rsa_full_auth_uses_oaep_and_removes_the_terminal_nul() {
-    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+    use rsa::pkcs8::DecodePublicKey;
     use rsa::rand_core::OsRng;
-    use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
+    use rsa::{Oaep, RsaPublicKey};
 
-    let private = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-    let public = RsaPublicKey::from(&private);
+    let (private_pem, public_pem) = rsa_authentication_keys();
+    let public = RsaPublicKey::from_public_key_pem(public_pem).unwrap();
     let salt = b"01234567890123456789";
     let mut wire_candidate = b"secret\0".to_vec();
     for (index, byte) in wire_candidate.iter_mut().enumerate() {
@@ -119,9 +136,8 @@ fn rsa_full_auth_uses_oaep_and_removes_the_terminal_nul() {
     let encrypted = public
         .encrypt(&mut OsRng, Oaep::new::<sha1::Sha1>(), &wire_candidate)
         .unwrap();
-    let private_pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
     assert_eq!(
-        decode_caching_sha2_full_auth(private_pem.as_str(), salt, &encrypted, false),
+        decode_caching_sha2_full_auth(|| private_pem, salt, &encrypted, false),
         Some(b"secret".to_vec())
     );
 }
@@ -296,6 +312,7 @@ struct AuthShim {
     plugin: &'static str,
     force_full: bool,
     empty_password: bool,
+    rsa_keys: fn() -> (&'static str, &'static str),
     authenticate_calls: Arc<AtomicUsize>,
     cleartext_calls: Arc<AtomicUsize>,
     result_calls: Arc<AtomicUsize>,
@@ -380,9 +397,22 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for AuthShim {
             .unwrap()
             .push(("caching", character_set, initial_handshake));
         (self.plugin == "caching_sha2_password").then(|| CachingSha2PasswordAuth {
-            public_key_pem: String::new(),
-            private_key_pem: String::new(),
+            rsa_keys: self.rsa_keys,
             force_full_auth: self.force_full,
+        })
+    }
+
+    async fn sha256_password_auth(
+        &self,
+        _username: &[u8],
+        _character_set: u16,
+        _initial_handshake: bool,
+        _salt: &[u8],
+        _initial_response: &[u8],
+    ) -> Option<CachingSha2PasswordAuth> {
+        (self.plugin == "sha256_password").then(|| CachingSha2PasswordAuth {
+            rsa_keys: self.rsa_keys,
+            force_full_auth: true,
         })
     }
 
@@ -478,6 +508,7 @@ fn auth_shim(plugin: &'static str, force_full: bool) -> AuthShim {
         plugin,
         force_full,
         empty_password: false,
+        rsa_keys: || panic!("this authentication exchange must not borrow RSA keys"),
         authenticate_calls: Arc::new(AtomicUsize::new(0)),
         cleartext_calls: Arc::new(AtomicUsize::new(0)),
         result_calls: Arc::new(AtomicUsize::new(0)),
@@ -896,6 +927,139 @@ async fn caching_sha2_exchange_has_distinct_fast_and_tls_full_paths() {
     );
     assert_eq!(direct_calls.load(Ordering::Relaxed), 0);
     assert_eq!(cleartext_calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn sha256_tls_full_auth_does_not_borrow_rsa_keys() {
+    let shim = auth_shim("sha256_password", true);
+    let calls = Arc::clone(&shim.cleartext_calls);
+    let mut intermediary = auth_intermediary(shim, &[], true);
+    assert_eq!(
+        intermediary
+            .authenticate_exchange(
+                b"next_user",
+                45,
+                true,
+                Some("sha256_password"),
+                b"salt",
+                (0, b"secret\0"),
+            )
+            .await
+            .unwrap(),
+        (true, 0, true),
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn real_sha2_rsa_full_auth_borrows_the_same_keys_only_for_reply_and_decryption() {
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::rand_core::OsRng;
+    use rsa::{Oaep, RsaPublicKey};
+    static KEY_BORROWS: AtomicUsize = AtomicUsize::new(0);
+    fn observed_keys() -> (&'static str, &'static str) {
+        KEY_BORROWS.fetch_add(1, Ordering::Relaxed);
+        rsa_authentication_keys()
+    }
+    let (_, public_pem) = rsa_authentication_keys();
+    let public = RsaPublicKey::from_public_key_pem(public_pem).unwrap();
+    let salt = b"01234567890123456789";
+    let mut wire_candidate = b"secret\0".to_vec();
+    for (index, byte) in wire_candidate.iter_mut().enumerate() {
+        *byte ^= salt[index % salt.len()];
+    }
+    for plugin in ["caching_sha2_password", "sha256_password"] {
+        for request_public_key in [false, true] {
+            let encrypted = public
+                .encrypt(&mut OsRng, Oaep::new::<sha1::Sha1>(), &wire_candidate)
+                .unwrap();
+            let mut shim = auth_shim(plugin, true);
+            shim.rsa_keys = observed_keys;
+            let calls = Arc::clone(&shim.cleartext_calls);
+            let mut input = Vec::new();
+            let initial_response = if plugin == "caching_sha2_password" {
+                if request_public_key {
+                    input.extend(framed(2, &[2]));
+                    input.extend(framed(4, &encrypted));
+                } else {
+                    input.extend(framed(2, &encrypted));
+                }
+                b"cache-miss".as_slice()
+            } else if request_public_key {
+                input.extend(framed(2, &encrypted));
+                &[1]
+            } else {
+                encrypted.as_slice()
+            };
+            let mut output = Vec::new();
+            let mut exchange = AsyncMysqlIntermediary {
+                client_capabilities: CapabilityFlags::empty(),
+                process_use_statement_on_query: false,
+                reject_connection_on_dbname_absence: false,
+                shim,
+                reader: PacketReader::new(input.as_slice()),
+                writer: PacketWriter::new(&mut output),
+                zstd_compression_level: 0,
+                secure_transport: false,
+                uncompressed_allowed: true,
+            };
+            let before = KEY_BORROWS.load(Ordering::Relaxed);
+            let expected_seq = if plugin == "caching_sha2_password" {
+                2
+            } else {
+                0
+            } + if request_public_key { 2 } else { 0 };
+            assert_eq!(
+                exchange
+                    .authenticate_exchange(
+                        b"next_user",
+                        45,
+                        true,
+                        Some(plugin),
+                        salt,
+                        (0, initial_response),
+                    )
+                    .await
+                    .unwrap(),
+                (true, expected_seq, true)
+            );
+            assert_eq!(
+                KEY_BORROWS.load(Ordering::Relaxed) - before,
+                1,
+                "only the real RSA branch borrows its one original key pair"
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            drop(exchange);
+            let mut packets = PacketReader::new(output.as_slice());
+            if plugin == "caching_sha2_password" {
+                let (seq, packet) = packets.next_async().await.unwrap().unwrap();
+                assert_eq!((seq, packet.as_ref()), (1, b"\x01\x04".as_slice()));
+            }
+            if request_public_key {
+                let (seq, packet) = packets.next_async().await.unwrap().unwrap();
+                assert_eq!(
+                    seq,
+                    if plugin == "caching_sha2_password" {
+                        3
+                    } else {
+                        1
+                    }
+                );
+                let key = if plugin == "caching_sha2_password" {
+                    assert_eq!(packet[0], 1);
+                    &packet[1..]
+                } else {
+                    packet.as_ref()
+                };
+                assert_eq!(
+                    key,
+                    public_pem.as_bytes(),
+                    "the published key is the same key that encrypted the accepted proof"
+                );
+            }
+            assert!(packets.next_async().await.unwrap().is_none());
+        }
+    }
 }
 
 #[tokio::test]

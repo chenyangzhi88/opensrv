@@ -559,9 +559,9 @@ where
 
         if self.result.as_mut().unwrap().is_bin {
             if self.col == 0 {
-                self.result.as_mut().unwrap().writer.write_u8(0x00)?;
-
-                // leave space for nullmap
+                // The synchronous encoder can borrow a locked native row.
+                // Keep its bytes here until end_row can read live NET state
+                // after that borrow ends, together with the packet prefix.
                 self.data.resize_zeroed(self.bitmap_len)?;
             }
 
@@ -608,6 +608,7 @@ where
         }
 
         if self.result.as_mut().unwrap().is_bin {
+            self.result.as_mut().unwrap().writer.write_u8(0x00)?;
             self.result
                 .as_mut()
                 .unwrap()
