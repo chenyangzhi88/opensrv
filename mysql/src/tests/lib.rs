@@ -631,6 +631,7 @@ struct FrontierShim {
     read_reject_at: Option<usize>,
     read_fail_at: Option<usize>,
     read_error_code: u16,
+    after_query_shutdown: Option<Arc<tokio::sync::Notify>>,
     initialization_error: bool,
     initialization_calls: Arc<AtomicUsize>,
     disconnects: Arc<AtomicUsize>,
@@ -678,6 +679,7 @@ impl Default for FrontierShim {
             read_reject_at: None,
             read_fail_at: None,
             read_error_code: 4082,
+            after_query_shutdown: None,
             initialization_error: false,
             initialization_calls: Arc::new(AtomicUsize::new(0)),
             disconnects: Arc::new(AtomicUsize::new(0)),
@@ -880,6 +882,9 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for FrontierShim {
             return Err(io::Error::other("actual read-admission operational error"));
         }
         Ok((self.read_reject_at == Some(call)).then(|| {
+            if let Some(shutdown) = &self.after_query_shutdown {
+                shutdown.notify_one();
+            }
             (
                 self.read_error_code,
                 *b"HY000",
@@ -943,7 +948,18 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for FrontierShim {
     }
     async fn on_query_finished(&mut self) -> io::Result<()> {
         self.query_finishes.fetch_add(1, Ordering::SeqCst);
+        if let Some(shutdown) = &self.after_query_shutdown {
+            shutdown.notify_one();
+        }
         Ok(())
+    }
+    fn connection_shutdown(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        match self.after_query_shutdown.clone() {
+            Some(shutdown) => Box::pin(async move { shutdown.notified().await }),
+            None => Box::pin(std::future::pending()),
+        }
     }
     async fn command_admission_error(
         &mut self,
@@ -1082,7 +1098,13 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for FrontierShim {
         sql: &'a [u8],
         writer: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
-        <Shim as AsyncMysqlShim<W>>::on_query(&mut self.inner, sql, writer).await
+        if self.after_query_shutdown.is_some() && self.fail_sql {
+            writer
+                .error_raw(4082, b"HY000", b"original completed fatal response")
+                .await
+        } else {
+            <Shim as AsyncMysqlShim<W>>::on_query(&mut self.inner, sql, writer).await
+        }
     }
     async fn on_process_info<'a>(&'a mut self, writer: QueryResultWriter<'a, W>) -> io::Result<()> {
         self.process_infos.fetch_add(1, Ordering::SeqCst);
@@ -4655,4 +4677,124 @@ async fn a_claimed_ssl_bit_is_not_a_context_and_plain_init_cannot_masquerade_as_
     assert_eq!(sequence, 2);
     assert_eq!(error.as_ref(), b"\xff\x13\x04#08S01Bad handshake");
     assert!(packets.next_async().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn completed_response_shutdown_precedes_next_read_admission_but_keeps_its_first_error() {
+    use super::packet_reader::compression_frame;
+    for compression in 0..=2 {
+        for first_read_error in [false, true] {
+            for completed_error in [false, true] {
+                let shim = FrontierShim {
+                    after_query_shutdown: Some(Arc::new(tokio::sync::Notify::new())),
+                    read_reject_at: Some(if first_read_error { 1 } else { 2 }),
+                    fail_sql: completed_error,
+                    ..Default::default()
+                };
+                let calls = Arc::clone(&shim.read_calls);
+                let finishes = Arc::clone(&shim.query_finishes);
+                let disconnects = Arc::clone(&shim.disconnects);
+                let frontiers = Arc::clone(&shim.command_frontiers);
+                let wire_frame = |payload: &[u8]| {
+                    let raw = frame(payload);
+                    if compression == 0 {
+                        raw
+                    } else {
+                        compression_frame(0, &raw, compression == 2)
+                    }
+                };
+                let first = wire_frame(b"\x03SELECT completed_response");
+                let mut input = first.clone();
+                input.extend_from_slice(&wire_frame(&[0x0e]));
+                let consumed = Arc::new(AtomicUsize::new(0));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let flushes = Arc::new(AtomicUsize::new(0));
+                let mut output = Vec::new();
+                let mut reader = PacketReader::new(CommandReadProbe {
+                    input: &input,
+                    consumed: Arc::clone(&consumed),
+                    polls,
+                });
+                let mut writer = PacketWriter::new(CommandWriteProbe {
+                    output: &mut output,
+                    flushes: Arc::clone(&flushes),
+                    fail_flush: false,
+                });
+                if compression == 1 {
+                    reader.enable_compression();
+                    writer.enable_compression();
+                } else if compression == 2 {
+                    reader.enable_zstd_compression();
+                    writer.enable_zstd_compression(1);
+                }
+                let intermediary = AsyncMysqlIntermediary {
+                    client_capabilities: CapabilityFlags::CLIENT_PROTOCOL_41,
+                    process_use_statement_on_query: false,
+                    reject_connection_on_dbname_absence: false,
+                    shim,
+                    reader,
+                    writer,
+                    zstd_compression_level: if compression == 2 { 1 } else { 0 },
+                    secure_transport: false,
+                    uncompressed_allowed: true,
+                };
+                intermediary.run().await.unwrap();
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "a ready shutdown cannot perform another quota read"
+                );
+                assert_eq!(
+                    finishes.load(Ordering::SeqCst),
+                    usize::from(!first_read_error)
+                );
+                assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    consumed.load(Ordering::SeqCst),
+                    if first_read_error { 0 } else { first.len() }
+                );
+                assert_eq!(
+                    frontiers.lock().unwrap().as_slice(),
+                    if first_read_error {
+                        &[][..]
+                    } else {
+                        &[(0x03, false), (0x03, true)][..]
+                    }
+                );
+                assert!(
+                    flushes.load(Ordering::SeqCst) > 0,
+                    "the original response is flushed before shutdown"
+                );
+                let mut replies = PacketReader::new(output.as_slice());
+                if compression == 1 {
+                    replies.enable_compression();
+                } else if compression == 2 {
+                    replies.enable_zstd_compression();
+                }
+                if compression != 0 && !first_read_error {
+                    replies.set_compressed_sequence(1);
+                }
+                let (seq, response) = replies.next_async().await.unwrap().unwrap();
+                assert_eq!(seq, if first_read_error { 0 } else { 1 });
+                if first_read_error {
+                    let mut expected = vec![0xff, 0xf2, 0x0f];
+                    expected.extend_from_slice(
+                        "#HY000backend quota limit=7, memory=8; 原始条件".as_bytes(),
+                    );
+                    assert_eq!(response.as_ref(), expected.as_slice());
+                } else if completed_error {
+                    assert_eq!(
+                        response.as_ref(),
+                        b"\xff\xf2\x0f#HY000original completed fatal response"
+                    );
+                } else {
+                    assert_eq!(response[0], 0);
+                }
+                assert!(
+                    replies.next_async().await.unwrap().is_none(),
+                    "shutdown adds no second ERR or successor reply"
+                );
+            }
+        }
+    }
 }

@@ -2048,8 +2048,17 @@ where
                 .set_max_allowed_packet(self.shim.max_allowed_packet());
             // An existing init-connect error owns its original first-command
             // response. Do not replace it with a new read-admission condition.
+            let mut shutdown = self.shim.connection_shutdown();
             if initialization_error.is_none() {
-                if let Some((code, state, message)) = self.shim.before_command_read().await? {
+                // A completed response has already been flushed. An existing
+                // shutdown owns this boundary before another read admission
+                // can report a second condition on the closed connection.
+                let admission = tokio::select! {
+                    biased;
+                    _ = &mut shutdown => break,
+                    admission = self.shim.before_command_read() => admission?,
+                };
+                if let Some((code, state, message)) = admission {
                     // Native net_new_transaction resets only pkt_nr before
                     // memory admission. No read has reset compress_pkt_nr yet;
                     // keep the writer's actual previous compressed sequence.
@@ -2060,11 +2069,10 @@ where
                     break;
                 }
             }
-            let shutdown = self.shim.connection_shutdown();
             let read = self.reader.next_async_new_command(self.shim.idle_timeout());
             let packet = tokio::select! {
                 biased;
-                _ = shutdown => break,
+                _ = &mut shutdown => break,
                 packet = read => packet.map_err(B::Error::from)?,
             };
             let Some((seq, packet)) = packet else {
